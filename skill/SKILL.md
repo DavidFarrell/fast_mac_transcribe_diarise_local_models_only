@@ -12,10 +12,24 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs 
 
 ## Full Workflow
 
-1. **Transcribe & Diarize** - Run the fast transcription
+1. **Transcribe & Diarize** - Run the fast transcription (output to /tmp/)
 2. **Identify Speakers** - Use visual + textual cues to map SPEAKER_XX to real names
 3. **Confirm with User** - Present findings, get confirmation
 4. **Rewrite Transcript** - Replace speaker labels with real names
+5. **Decide Output Destination** - Keep in /tmp/, copy to permanent location, or discard
+
+---
+
+## Output Location
+
+**ALL output goes to `/tmp/fast-diarize/` initially.**
+
+This includes:
+- Transcripts (transcript.txt, transcript.json)
+- Frames extracted for speaker identification
+- Named transcripts after speaker identification
+
+**Why?** The user might just want to transcribe something to ask a question about it, not keep files permanently. Claude decides what to do with the output based on context, or asks the user if unclear.
 
 ---
 
@@ -44,7 +58,7 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs 
 
 ```bash
 cd /Users/david/git/ai-sandbox/projects/fast_mac_transcribe_diarise_local_models_only && \
-OUTPUT_DIR="<output_dir>" && \
+OUTPUT_DIR="/tmp/fast-diarize/$(date +%Y%m%d_%H%M%S)" && \
 mkdir -p "$OUTPUT_DIR" && \
 uv run diarise-transcribe \
   --in "<audio_file>" \
@@ -52,6 +66,8 @@ uv run diarise-transcribe \
   --out-json "$OUTPUT_DIR/transcript.json" \
   --verbose
 ```
+
+Note: Frames for speaker identification also go in `$OUTPUT_DIR/frames/`.
 
 ---
 
@@ -264,6 +280,45 @@ Keep originals intact.
 [00:14.40 - 00:21.44] Eleanor: Hey Isaac. You are muted, I think.
 [00:24.16 - 00:28.24] Isaac: Hey, can you hear me now?
 ```
+
+---
+
+## Phase 5: Decide Output Destination
+
+After transcription and speaker identification are complete, decide what to do with the files.
+
+**All files are currently in `/tmp/fast-diarize/<timestamp>/`**
+
+### Decision Logic
+
+**Claude should infer from context:**
+
+| Context | Action |
+|---------|--------|
+| User asked a question about the content | Leave in /tmp/, answer the question, done |
+| User is building a resource (course notes, meeting archive) | Copy to permanent location next to source file |
+| User explicitly said where to save | Copy to that location |
+| Unclear | Ask the user |
+
+### If Asking the User
+
+Use AskUserQuestion with options:
+- "Save next to source file" - Copy transcript(s) to same folder as the audio/video
+- "Save to specific location" - Ask for destination path
+- "Keep in /tmp/" - Leave as-is (will be cleaned up eventually)
+- "Discard" - Delete the temp folder now
+
+### Copy Command
+
+```bash
+# Copy final transcripts to permanent location
+cp /tmp/fast-diarize/<timestamp>/transcript_named.txt "<destination>/<filename>_transcript.txt"
+cp /tmp/fast-diarize/<timestamp>/transcript_named.json "<destination>/<filename>_transcript.json"
+```
+
+If speaker identification wasn't done, copy the original transcript.txt/json instead.
+
+**Do NOT copy frames** - they were only for speaker identification and aren't needed permanently.
 
 ---
 
