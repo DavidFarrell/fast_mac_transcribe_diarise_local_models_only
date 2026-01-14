@@ -85,18 +85,49 @@ class ASRModel:
             overlap_duration=overlap_duration,
         )
 
-        # Extract words from sentences -> tokens
+        # Extract words by merging BPE subword tokens
+        # BPE tokens starting with space (or ▁) indicate new word boundaries
         words = []
+        current_word_tokens = []
+
         for sentence in result.sentences:
             for token in sentence.tokens:
-                # Clean up token text (remove leading space if present)
-                text = token.text.strip()
-                if text:  # Skip empty tokens
-                    words.append(Word(
-                        text=text,
-                        start=token.start,
-                        end=token.end,
-                    ))
+                token_text = token.text
+                if not token_text:
+                    continue
+
+                # Check if this token starts a new word
+                # New word indicators: leading space, leading ▁, or first token
+                is_new_word = (
+                    token_text.startswith(" ") or
+                    token_text.startswith("▁") or
+                    not current_word_tokens
+                )
+
+                if is_new_word and current_word_tokens:
+                    # Finish previous word
+                    word_text = "".join(t.text for t in current_word_tokens)
+                    word_text = word_text.strip().replace("▁", "")
+                    if word_text:
+                        words.append(Word(
+                            text=word_text,
+                            start=current_word_tokens[0].start,
+                            end=current_word_tokens[-1].end,
+                        ))
+                    current_word_tokens = []
+
+                current_word_tokens.append(token)
+
+        # Don't forget the last word
+        if current_word_tokens:
+            word_text = "".join(t.text for t in current_word_tokens)
+            word_text = word_text.strip().replace("▁", "")
+            if word_text:
+                words.append(Word(
+                    text=word_text,
+                    start=current_word_tokens[0].start,
+                    end=current_word_tokens[-1].end,
+                ))
 
         return TranscriptResult(
             text=result.text,

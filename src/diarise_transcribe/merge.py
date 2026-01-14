@@ -103,12 +103,10 @@ def assign_speakers_to_words(
 
 def _join_words_smart(words: List[LabelledWord]) -> str:
     """
-    Intelligently join words handling punctuation and contractions.
+    Intelligently join words handling punctuation.
 
-    Handles cases like:
-    - "I ' d" -> "I'd"
-    - "don ' t" -> "don't"
-    - "Hello . How" -> "Hello. How"
+    Words are now properly merged from BPE tokens, so we mainly
+    need to handle punctuation spacing.
     """
     if not words:
         return ""
@@ -119,17 +117,12 @@ def _join_words_smart(words: List[LabelledWord]) -> str:
         if not text:
             continue
 
-        # Check if this token should join without space
-        # (punctuation, apostrophes, continuation of previous word)
-        if parts and (
-            text in ".,!?;:'\"-" or  # Punctuation
-            text.startswith("'") or  # Contractions like 'd, 's, 't
-            (len(text) == 1 and not text.isalnum())  # Single non-alphanumeric
-        ):
+        # Punctuation that should attach to previous word (no leading space)
+        if parts and text in ".,!?;:)]}\"'":
             parts.append(text)
-        elif parts and parts[-1] in "'-":
-            # Previous was apostrophe/hyphen, join without space
-            parts.append(text)
+        # Opening brackets/quotes attach to next word (no trailing space after)
+        elif text in "([{\"'" and parts:
+            parts.append(" " + text)
         elif parts:
             parts.append(" " + text)
         else:

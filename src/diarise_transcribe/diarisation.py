@@ -498,21 +498,60 @@ class SortformerDiarizer:
 
         return segments
 
+    def _median_filter(self, probs: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+        """Apply median filter to smooth frame probabilities."""
+        from scipy.ndimage import median_filter
+        return median_filter(probs, size=kernel_size, mode='nearest')
+
+    def _apply_hysteresis(
+        self,
+        probs: np.ndarray,
+        on_threshold: float = 0.4,
+        off_threshold: float = 0.6,
+    ) -> np.ndarray:
+        """
+        Apply hysteresis thresholding to prevent rapid on/off switching.
+
+        Speaker turns ON when prob >= on_threshold
+        Speaker turns OFF when prob < off_threshold
+        """
+        is_active = np.zeros(len(probs), dtype=bool)
+        currently_active = False
+
+        for i, prob in enumerate(probs):
+            if currently_active:
+                # Stay active until we drop below off_threshold
+                if prob < off_threshold:
+                    currently_active = False
+            else:
+                # Turn on when we exceed on_threshold
+                if prob >= on_threshold:
+                    currently_active = True
+            is_active[i] = currently_active
+
+        return is_active
+
     def _predictions_to_segments(
         self,
         predictions: np.ndarray,
         sample_rate: int,
-        threshold: float = 0.5,
-        min_segment_duration: float = 0.1,
+        on_threshold: float = 0.4,
+        off_threshold: float = 0.6,
+        min_segment_duration: float = 0.25,
+        median_kernel: int = 5,
     ) -> List[DiarSegment]:
         """
         Convert frame-level predictions to speaker segments.
 
+        Uses median filtering and hysteresis to reduce over-segmentation.
+
         Args:
             predictions: [n_frames, n_speakers] probabilities
             sample_rate: Original audio sample rate
-            threshold: Probability threshold for speaker activity
+            on_threshold: Probability to turn speaker ON (hysteresis)
+            off_threshold: Probability to turn speaker OFF (hysteresis)
             min_segment_duration: Minimum segment duration in seconds
+            median_kernel: Kernel size for median filter smoothing
 
         Returns:
             List of DiarSegment
@@ -530,8 +569,11 @@ class SortformerDiarizer:
         for speaker_idx in range(n_speakers):
             speaker_probs = predictions[:, speaker_idx]
 
-            # Find contiguous regions above threshold
-            is_active = speaker_probs >= threshold
+            # Step 1: Apply median filter to smooth noisy probabilities
+            smoothed_probs = self._median_filter(speaker_probs, kernel_size=median_kernel)
+
+            # Step 2: Apply hysteresis thresholding
+            is_active = self._apply_hysteresis(smoothed_probs, on_threshold, off_threshold)
 
             # Find segment boundaries
             changes = np.diff(is_active.astype(int))
@@ -544,7 +586,7 @@ class SortformerDiarizer:
             if is_active[-1]:
                 ends = np.concatenate([ends, [n_frames]])
 
-            # Create segments
+            # Create segments (filtering by minimum duration)
             for start_frame, end_frame in zip(starts, ends):
                 start_time = start_frame * frame_duration
                 end_time = end_frame * frame_duration
@@ -560,7 +602,7 @@ class SortformerDiarizer:
         # Sort by start time
         segments.sort(key=lambda s: s.start)
 
-        # Merge overlapping segments for same speaker
+        # Merge overlapping/adjacent segments for same speaker
         segments = self._merge_overlapping_segments(segments)
 
         return segments
