@@ -80,10 +80,10 @@ Examples:
     # Model options
     parser.add_argument(
         "--diar-backend",
-        choices=["sortformer", "senko"],
-        default="sortformer",
-        help="Diarisation backend: 'sortformer' (CoreML Sortformer) or "
-             "'senko' (CoreML pyannote+CAM++) (default: sortformer)",
+        choices=["senko", "sortformer"],
+        default="senko",
+        help="Diarisation backend: 'senko' (CoreML pyannote+CAM++, recommended) or "
+             "'sortformer' (CoreML Sortformer) (default: senko)",
     )
     parser.add_argument(
         "--diar-model",
@@ -148,7 +148,7 @@ def run_pipeline(
     output_json: Optional[str] = None,
     output_srt: Optional[str] = None,
     output_rttm: Optional[str] = None,
-    diar_backend: str = "sortformer",
+    diar_backend: str = "senko",
     diar_model: str = "default",
     asr_model: str = DEFAULT_MODEL,
     language: Optional[str] = None,
