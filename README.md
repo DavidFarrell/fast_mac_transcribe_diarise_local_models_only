@@ -18,6 +18,19 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 
 ## Installation
 
+### Option 1: Using UV (recommended)
+
+```bash
+# Clone the repo
+git clone git@github.com:DavidFarrell/fast_mac_transcribe_diarise_local_models_only.git
+cd fast_mac_transcribe_diarise_local_models_only
+
+# Run directly with uv (handles venv automatically)
+uv run diarise-transcribe --in audio.mp4 --out transcript.txt
+```
+
+### Option 2: Traditional pip
+
 ```bash
 # Clone the repo
 git clone git@github.com:DavidFarrell/fast_mac_transcribe_diarise_local_models_only.git
@@ -27,21 +40,23 @@ cd fast_mac_transcribe_diarise_local_models_only
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install the package
+# Install the package (includes Senko)
 pip install -e .
-
-# Install Senko diarisation backend
-pip install "git+https://github.com/narcotic-sh/senko.git"
 ```
 
 ## Usage
 
-```bash
-# Activate the venv
-source .venv/bin/activate
+### With UV (no venv activation needed)
 
-# Basic usage - transcribe with speaker labels
-python -m diarise_transcribe --in audio.mp4 --out transcript.txt
+```bash
+uv run diarise-transcribe --in audio.mp4 --out transcript.txt
+```
+
+### With pip/venv
+
+```bash
+source .venv/bin/activate
+diarise-transcribe --in audio.mp4 --out transcript.txt
 
 # All output formats
 python -m diarise_transcribe --in recording.mp4 \

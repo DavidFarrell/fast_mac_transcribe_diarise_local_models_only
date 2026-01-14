@@ -21,6 +21,7 @@ dependencies = [
     "librosa>=0.10.0",
     "huggingface-hub>=0.20.0",
     "coremltools>=7.0",
+    "senko @ git+https://github.com/narcotic-sh/senko.git",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,9 @@ dev = [
 
 [project.scripts]
 diarise-transcribe = "diarise_transcribe.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/diarise_transcribe"]
