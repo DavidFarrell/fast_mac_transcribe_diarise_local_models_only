@@ -535,23 +535,22 @@ class SortformerDiarizer:
         self,
         predictions: np.ndarray,
         sample_rate: int,
-        on_threshold: float = 0.4,
-        off_threshold: float = 0.6,
-        min_segment_duration: float = 0.25,
+        min_segment_duration: float = 0.3,
         median_kernel: int = 5,
+        silence_threshold: float = 0.15,
     ) -> List[DiarSegment]:
         """
-        Convert frame-level predictions to speaker segments.
+        Convert frame-level predictions to speaker segments using argmax.
 
-        Uses median filtering and hysteresis to reduce over-segmentation.
+        Uses winner-take-all approach: assigns each frame to the speaker
+        with highest probability (if above silence threshold).
 
         Args:
             predictions: [n_frames, n_speakers] probabilities
             sample_rate: Original audio sample rate
-            on_threshold: Probability to turn speaker ON (hysteresis)
-            off_threshold: Probability to turn speaker OFF (hysteresis)
             min_segment_duration: Minimum segment duration in seconds
             median_kernel: Kernel size for median filter smoothing
+            silence_threshold: Minimum max probability to assign any speaker
 
         Returns:
             List of DiarSegment
@@ -559,51 +558,66 @@ class SortformerDiarizer:
         n_frames, n_speakers = predictions.shape
 
         # Frame duration in seconds
-        # Each encoder frame = subsampling_factor * hop_length samples
         hop_length = MEL_CONFIG["hop_length"]
         sub_factor = self.config["subsampling_factor"]
         frame_duration = (hop_length * sub_factor) / sample_rate
 
-        segments = []
-
+        # Step 1: Apply median filter to smooth each speaker's probabilities
+        smoothed = np.zeros_like(predictions)
         for speaker_idx in range(n_speakers):
-            speaker_probs = predictions[:, speaker_idx]
+            smoothed[:, speaker_idx] = self._median_filter(
+                predictions[:, speaker_idx], kernel_size=median_kernel
+            )
 
-            # Step 1: Apply median filter to smooth noisy probabilities
-            smoothed_probs = self._median_filter(speaker_probs, kernel_size=median_kernel)
+        # Step 2: Argmax - assign each frame to highest probability speaker
+        max_probs = np.max(smoothed, axis=1)
+        speaker_ids = np.argmax(smoothed, axis=1)
 
-            # Step 2: Apply hysteresis thresholding
-            is_active = self._apply_hysteresis(smoothed_probs, on_threshold, off_threshold)
+        # Mark frames as silence if max prob below threshold
+        speaker_ids[max_probs < silence_threshold] = -1
 
-            # Find segment boundaries
-            changes = np.diff(is_active.astype(int))
-            starts = np.where(changes == 1)[0] + 1
-            ends = np.where(changes == -1)[0] + 1
+        # Step 3: Convert frame-level labels to segments
+        segments = []
+        if len(speaker_ids) == 0:
+            return segments
 
-            # Handle edge cases
-            if is_active[0]:
-                starts = np.concatenate([[0], starts])
-            if is_active[-1]:
-                ends = np.concatenate([ends, [n_frames]])
+        current_speaker = speaker_ids[0]
+        segment_start = 0
 
-            # Create segments (filtering by minimum duration)
-            for start_frame, end_frame in zip(starts, ends):
-                start_time = start_frame * frame_duration
-                end_time = end_frame * frame_duration
-                duration = end_time - start_time
+        for frame_idx in range(1, len(speaker_ids)):
+            if speaker_ids[frame_idx] != current_speaker:
+                # End current segment
+                if current_speaker >= 0:  # Not silence
+                    start_time = segment_start * frame_duration
+                    end_time = frame_idx * frame_duration
+                    duration = end_time - start_time
 
-                if duration >= min_segment_duration:
-                    segments.append(DiarSegment(
-                        start=round(start_time, 2),
-                        end=round(end_time, 2),
-                        speaker=f"SPEAKER_{speaker_idx:02d}",
-                    ))
+                    if duration >= min_segment_duration:
+                        segments.append(DiarSegment(
+                            start=round(start_time, 2),
+                            end=round(end_time, 2),
+                            speaker=f"SPEAKER_{current_speaker:02d}",
+                        ))
 
-        # Sort by start time
-        segments.sort(key=lambda s: s.start)
+                # Start new segment
+                current_speaker = speaker_ids[frame_idx]
+                segment_start = frame_idx
 
-        # Merge overlapping/adjacent segments for same speaker
-        segments = self._merge_overlapping_segments(segments)
+        # Don't forget final segment
+        if current_speaker >= 0:
+            start_time = segment_start * frame_duration
+            end_time = n_frames * frame_duration
+            duration = end_time - start_time
+
+            if duration >= min_segment_duration:
+                segments.append(DiarSegment(
+                    start=round(start_time, 2),
+                    end=round(end_time, 2),
+                    speaker=f"SPEAKER_{current_speaker:02d}",
+                ))
+
+        # Merge adjacent segments from same speaker (within gap threshold)
+        segments = self._merge_overlapping_segments(segments, gap_threshold=0.5)
 
         return segments
 
