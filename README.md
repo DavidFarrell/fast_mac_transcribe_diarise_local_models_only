@@ -16,6 +16,11 @@ Blazing fast offline transcription + speaker diarisation for Apple Silicon Macs.
 - Python 3.10+
 - ffmpeg (`brew install ffmpeg`)
 
+### Optional (for Claude Code skill integration)
+
+- **ffmpeg** - Also used to extract video frames for speaker identification
+- **yt-dlp** (`brew install yt-dlp`) - Required for transcribing YouTube URLs
+
 ## Installation
 
 ### Option 1: Using UV (recommended)

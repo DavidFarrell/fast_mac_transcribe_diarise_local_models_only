@@ -1,6 +1,6 @@
 ---
 name: fast-diarize
-description: Transcribe audio/video with speaker diarization (who said what). FAST - 58x realtime on Apple Silicon. Uses Parakeet MLX + Senko CoreML. Outputs speaker-labelled transcripts.
+description: Transcribe audio/video with speaker diarization (who said what). FAST - 58x realtime on Apple Silicon. Uses Parakeet MLX + Senko CoreML. Outputs speaker-labelled transcripts. Accepts local files or YouTube URLs.
 ---
 
 # Fast Diarization Transcription
@@ -35,7 +35,34 @@ This includes:
 
 ## Phase 1: Transcription
 
-### Before Running
+### Input Types
+
+The skill accepts:
+- **Local files** - Any audio/video format ffmpeg supports
+- **YouTube URLs** - youtube.com, youtu.be links
+
+### For YouTube URLs
+
+If the input looks like a YouTube URL (contains `youtube.com` or `youtu.be`):
+
+1. **Download video (for frame extraction):**
+   ```bash
+   OUTPUT_DIR="/tmp/fast-diarize/$(date +%Y%m%d_%H%M%S)"
+   mkdir -p "$OUTPUT_DIR"
+   yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+     -o "$OUTPUT_DIR/%(title)s.%(ext)s" "<youtube_url>"
+   ```
+
+2. **Get the downloaded filename:**
+   ```bash
+   VIDEO_FILE=$(ls "$OUTPUT_DIR"/*.mp4 "$OUTPUT_DIR"/*.webm "$OUTPUT_DIR"/*.mkv 2>/dev/null | head -1)
+   ```
+
+3. Then proceed with transcription using `$VIDEO_FILE` as input.
+
+**Note:** YouTube downloads go to the same /tmp/ location as all other output. Downloading video (not audio-only) preserves the ability to extract frames for speaker identification.
+
+### For Local Files
 
 1. **Get the file duration:**
    ```bash
@@ -48,7 +75,9 @@ This includes:
    ```
    (Returns "video" if video stream exists, empty if audio-only)
 
-3. **Confirm with user** using AskUserQuestion:
+### Before Running (All Input Types)
+
+**Confirm with user** using AskUserQuestion:
    - File name and duration
    - Estimated processing time (~1 sec per minute + 20s overhead)
    - Whether to attempt speaker identification after
