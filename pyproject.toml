@@ -21,6 +21,7 @@ dependencies = [
     "librosa>=0.10.0",
     "huggingface-hub>=0.20.0",
     "coremltools>=7.0",
+    "scikit-learn>=0.17,<1.6",
     "senko @ git+https://github.com/narcotic-sh/senko.git",
 ]
 
@@ -33,6 +34,7 @@ dev = [
 
 [project.scripts]
 diarise-transcribe = "diarise_transcribe.cli:main"
+muesli-backend = "diarise_transcribe.muesli_backend:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true

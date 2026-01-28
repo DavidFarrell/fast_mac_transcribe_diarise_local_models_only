@@ -74,6 +74,21 @@ python -m diarise_transcribe --in recording.mp4 \
 python -m diarise_transcribe --in audio.mp4 --out transcript.txt --verbose
 ```
 
+
+## Muesli Backend (framed stdin)
+
+Muesli streams framed PCM audio to stdin and expects JSONL events on stdout.
+Run the adapter like this:
+
+```bash
+uv run muesli-backend --output-dir /tmp/muesli --emit-meters
+```
+
+By default it transcribes the system stream. Use `--transcribe-stream mic` to target mic audio.
+Live partial/segment updates run every ~15s; tune with `--live-interval` or disable with `--no-live`.
+Captured audio is aligned by PTS and written to `system.wav`/`mic.wav` plus raw `system.pcm`/`mic.pcm`.
+Use `--keep-wav` or `--keep-pcm` to retain capture files.
+
 ## CLI Options
 
 | Option | Description |
