@@ -5,6 +5,13 @@ Usage:
     python -m diarise_transcribe --in audio.wav --out transcript.txt
 """
 
+# IMPORTANT: Set unique numba cache dir BEFORE any imports that trigger numba.
+# This prevents cache race conditions when running multiple transcriptions in parallel.
+# See: https://github.com/numba/numba/issues/10128
+import os as _os
+if 'NUMBA_CACHE_DIR' not in _os.environ:
+    _os.environ['NUMBA_CACHE_DIR'] = f'/tmp/numba_cache_{_os.getpid()}'
+
 import argparse
 import os
 import sys
