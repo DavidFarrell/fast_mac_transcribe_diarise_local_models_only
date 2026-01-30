@@ -4,6 +4,13 @@ Backend adapter for Muesli framed audio protocol -> diarise/transcribe pipeline.
 Reads framed messages on stdin and writes JSONL events to stdout.
 """
 
+# IMPORTANT: Set unique numba cache dir BEFORE any imports that trigger numba.
+# This prevents cache race conditions when running multiple transcriptions in parallel.
+# See: https://github.com/numba/numba/issues/10128
+import os as _os
+if 'NUMBA_CACHE_DIR' not in _os.environ:
+    _os.environ['NUMBA_CACHE_DIR'] = f'/tmp/numba_cache_{_os.getpid()}'
+
 from __future__ import annotations
 
 import argparse
