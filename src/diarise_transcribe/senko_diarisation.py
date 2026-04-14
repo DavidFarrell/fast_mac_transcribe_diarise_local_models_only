@@ -39,6 +39,30 @@ class SenkoDiarizer:
         self._quiet = quiet
         self._diarizer = None
 
+    @staticmethod
+    def _patch_numba_cache():
+        """Monkey-patch numba cache to survive 'underlying object has vanished' errors.
+
+        numba 0.63+ has a bug where weak references to dispatcher objects get
+        garbage collected during cache serialization, causing ReferenceError.
+        This patch makes the cache save fault-tolerant so JIT compilation still
+        works even if caching fails.
+        """
+        try:
+            from numba.core.caching import IndexDataCacheFile
+            _original_save = IndexDataCacheFile.save
+
+            def _safe_save(self, key, data):
+                try:
+                    return _original_save(self, key, data)
+                except (ReferenceError, KeyError):
+                    # Cache save failed but JIT compilation succeeded - that's fine
+                    pass
+
+            IndexDataCacheFile.save = _safe_save
+        except (ImportError, AttributeError):
+            pass  # numba version without this class - no patch needed
+
     def _ensure_loaded(self):
         """Lazy load Senko diarizer on first use."""
         if self._diarizer is not None:
@@ -52,6 +76,9 @@ class SenkoDiarizer:
                 "  pip install 'git+https://github.com/narcotic-sh/senko.git'\n"
                 f"Original error: {e}"
             )
+
+        # Patch numba cache before initializing (handles 0.63+ bug)
+        self._patch_numba_cache()
 
         if not self._quiet:
             print("Initializing Senko diarizer...")
