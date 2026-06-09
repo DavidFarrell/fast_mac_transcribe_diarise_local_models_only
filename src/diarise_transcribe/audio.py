@@ -21,6 +21,8 @@ def check_ffmpeg() -> bool:
             ["ffmpeg", "-version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         return result.returncode == 0
@@ -87,6 +89,12 @@ def normalise_audio(
         cmd,
         capture_output=True,
         text=True,
+        # ffmpeg echoes the source file's metadata (ID3 tags) to stderr, which can
+        # contain non-UTF-8 bytes (e.g. a Latin-1 em-dash in a podcast title).
+        # Without errors="replace" the implicit UTF-8 decode raises
+        # UnicodeDecodeError and the whole transcription dies before it starts.
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 

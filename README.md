@@ -114,6 +114,21 @@ python -m diarise_transcribe --in audio.mp4 --out transcript.txt --verbose
 }
 ```
 
+> **Note (word-level timestamps - underused downstream).** Every turn carries a
+> `words` array of `{text, start, end, speaker}` - real per-word timings from Parakeet
+> (`asr.py` extracts them, `merge.py` labels and writes them). This is precise enough
+> for word-accurate boundary work, but most consumers only read the turn-level
+> `start`/`end` and discard `words`.
+>
+> Concretely: the **Open Swimcast** podcast app
+> (`~/git/ai-sandbox/projects/OpenSwimPodcast`) trims podcast ads by cutting on
+> transcript-segment boundaries. Its `app/electron/transcribe.cjs::normalise()` maps
+> each turn to only `{speaker, start, end, text}` and drops the `words` array - so its
+> cuts land on whole-turn edges (often 20s+) and have to stay conservative. If we ever
+> tighten that, the data is already here: keep `words` through `normalise()` and snap
+> cut boundaries to word start/end. No re-transcription needed - just stop dropping the
+> field. Design write-up: `OpenSwimPodcast/docs/smart-processing/PHASE4_SPIKES.md`.
+
 ### SRT (`--out-srt`)
 ```
 1
