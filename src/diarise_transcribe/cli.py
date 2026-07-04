@@ -8,9 +8,33 @@ Usage:
 # IMPORTANT: Set unique numba cache dir BEFORE any imports that trigger numba.
 # This prevents cache race conditions when running multiple transcriptions in parallel.
 # See: https://github.com/numba/numba/issues/10128
+#
+# NOTE: the installed `senko` package (senko/config.py) unconditionally
+# overwrites NUMBA_CACHE_DIR with its own fixed ~/.cache/senko/numba_cache
+# the moment it's imported, so this per-PID setting has no effect on the
+# Senko backend's numba cache specifically - it is left in place unchanged
+# in case it matters for other numba use (e.g. the sortformer backend).
+#
+# Separately: best-effort, one-time BOOTSTRAP of senko's real numba cache
+# directory (~/.cache/senko/numba_cache) from a pre-warmed canonical
+# snapshot (see numba_cache.py) - but ONLY if that real directory is
+# currently missing or empty (fresh install / wiped cache). If it already
+# has any content, this is a strict no-op: nothing is copied, nothing is
+# overwritten, and a live run can never race with or clobber another
+# process's already-warm shared cache. Any failure here (missing/stale
+# canonical cache, copy error) silently falls back to today's cold-cache
+# behaviour - it must never raise and never write to a non-empty shared dir.
 import os as _os
 if 'NUMBA_CACHE_DIR' not in _os.environ:
     _os.environ['NUMBA_CACHE_DIR'] = f'/tmp/numba_cache_{_os.getpid()}'
+
+if _os.environ.get('DIARISE_TRANSCRIBE_SKIP_CACHE_WARMING') != '1':
+    try:
+        from .numba_cache import bootstrap_senko_cache_if_empty as _bootstrap_senko_cache_if_empty
+        _bootstrap_senko_cache_if_empty()
+    except Exception:
+        # Never let a warm-cache problem block startup - proceed cold.
+        pass
 
 import argparse
 import os
@@ -54,11 +78,12 @@ Examples:
         """,
     )
 
-    # Required input
+    # Required input (not required at the parser level so that --warm-cache,
+    # a separate maintenance mode, can run without it; enforced in main()).
     parser.add_argument(
         "--in", "-i",
         dest="input_file",
-        required=True,
+        default=None,
         help="Input audio file (any format ffmpeg supports)",
     )
 
@@ -144,6 +169,17 @@ Examples:
         "--verbose", "-v",
         action="store_true",
         help="Verbose output",
+    )
+
+    # Maintenance mode: warm the canonical numba JIT cache for the current
+    # numba/senko/python version. Intended to be run manually and alone
+    # (never by automation/daemons, never concurrently with live runs).
+    # Does not require --in/--out.
+    parser.add_argument(
+        "--warm-cache",
+        action="store_true",
+        help="Maintenance mode: warm the canonical numba JIT cache for this "
+             "environment (run alone, not during normal transcription) and exit",
     )
 
     return parser
@@ -302,6 +338,28 @@ def main():
     """Main entry point."""
     parser = create_parser()
     args = parser.parse_args()
+
+    if args.warm_cache:
+        try:
+            from .numba_cache import run_warm_cache
+            run_warm_cache(verbose=args.verbose)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user", file=sys.stderr)
+            sys.exit(130)
+        except Exception as e:
+            print(f"\nError warming numba cache: {e}", file=sys.stderr)
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+        return
+
+    if not args.input_file:
+        # Match the original argparse-enforced `required=True` behaviour
+        # exactly (exit code 2 + the standard usage banner on stderr), even
+        # though --in is no longer `required` at the parser level (it must
+        # be optional there so --warm-cache can run without it).
+        parser.error("--in/-i is required")
 
     try:
         run_pipeline(
