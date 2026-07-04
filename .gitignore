@@ -19,6 +19,9 @@ models/
 # Output files
 output/
 
+# Test tooling
+.pytest_cache/
+
 # IDE
 .idea/
 .vscode/
