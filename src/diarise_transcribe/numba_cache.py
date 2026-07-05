@@ -93,6 +93,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -202,8 +204,8 @@ def bootstrap_senko_cache_if_empty(
 ) -> bool:
     """
     Best-effort, one-time bootstrap of senko's real numba cache directory
-    from the canonical snapshot - but ONLY if that real directory is
-    currently missing or empty.
+    from the canonical snapshot - but ONLY if that real directory does not
+    exist at all yet.
 
     Must be called BEFORE senko (or anything importing senko.config) is
     imported, so that if we do populate the directory, senko's own
@@ -215,20 +217,36 @@ def bootstrap_senko_cache_if_empty(
     all - there is nothing to restore, since that directory already
     persists warmth across every run on its own. This guarantees a live
     run can never overwrite, race with, or corrupt another process's
-    already-warm shared cache; the only thing it can ever do is fill in an
-    empty directory.
+    already-warm shared cache; the only thing it can ever do is create and
+    fill in a directory that does not exist yet. An existing-but-EMPTY
+    dest is deliberately treated the same as "already has content" for the
+    purposes of the final claim step (see below) - it is indistinguishable
+    from a directory senko itself just created and is about to write its
+    first cache file into, so bootstrap backs off rather than claiming it.
 
     Concurrency: two live runs can both observe an empty/missing ``dest``
     at (near-)the same time. To avoid both processes copying into the same
     destination directory concurrently (which could leave a numba index
     file truncated mid-read for whichever process gets there first), the
     canonical snapshot is first copied into a private, per-process staging
-    directory next to ``dest``, and only then swapped into place with a
-    single ``os.rename`` - which is atomic on the same filesystem, so any
-    reader of ``dest`` sees either "doesn't exist yet" or "fully populated",
-    never a partial copy. If another process wins the race and creates
-    ``dest`` first, our rename fails harmlessly and the staging copy is
-    discarded (still a no-op from the caller's point of view).
+    directory next to ``dest``, and only then swapped into place.
+
+    That final swap is deliberately NOT a bare ``os.rename(staging, dest)``:
+    on POSIX, ``rename()`` silently succeeds (replacing the target) when
+    ``dest`` already exists as an *empty* directory - which is exactly the
+    state senko's own ``cache_dir.mkdir(parents=True, exist_ok=True)``
+    leaves it in the instant before senko writes its first real cache file.
+    A plain rename could therefore win a race against senko itself: we'd
+    replace the very directory another process is about to populate, with
+    no error on either side. To close that, we instead atomically *claim*
+    ``dest`` ourselves first via ``os.mkdir(dest)`` (which - unlike rename
+    - always raises if the path already exists, empty or not) and only
+    rename our staged copy onto the directory we just created. If the
+    ``mkdir`` fails, we know for certain some other actor (another
+    bootstrap or senko itself) already holds that path, and we back off
+    completely without touching it. If it succeeds, no other process can
+    also be holding it, so the rename onto our own fresh empty dir is
+    provably race-free.
 
     Returns True if a bootstrap copy happened, False otherwise (including
     on any error, or when there was simply nothing to do). Never raises -
@@ -252,12 +270,21 @@ def bootstrap_senko_cache_if_empty(
 
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # Copy into a private, per-process staging dir first (never a
-        # shared path another process could also be writing to), then
-        # atomically rename it into place. This avoids two concurrent
-        # bootstraps ever interleaving writes into the same destination
-        # files.
-        staging = dest.parent / f".{dest.name}.bootstrap-{os.getpid()}"
+        # Copy into a private, per-call staging dir first (never a shared
+        # path another process - or another THREAD in this same process -
+        # could also be writing to), then atomically rename it into place.
+        # This avoids two concurrent bootstraps ever interleaving writes
+        # into the same destination files.
+        #
+        # PID alone is not sufficient: two threads in the same process
+        # (e.g. two concurrent bootstrap calls in one long-lived daemon)
+        # share a PID, so a PID-only name collides and lets one thread's
+        # rmtree/copytree race the other's, tearing the copy. Mix in the
+        # thread id and a UUID4 so every call gets a distinct staging path
+        # regardless of process/thread reuse.
+        staging = dest.parent / (
+            f".{dest.name}.bootstrap-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}"
+        )
         shutil.rmtree(staging, ignore_errors=True)
 
         # copy_function=copy2 preserves mtimes numba may care about.
@@ -272,13 +299,30 @@ def bootstrap_senko_cache_if_empty(
             return False
 
         try:
+            # Atomically CLAIM dest via mkdir (not rename): mkdir always
+            # raises if the path already exists, even as an empty dir -
+            # unlike os.rename, which would silently replace an existing
+            # empty dest. This is what closes the race against senko's own
+            # `cache_dir.mkdir(parents=True, exist_ok=True)`: if senko (or
+            # another bootstrap) already created dest - populated or not -
+            # our mkdir fails and we back off untouched. If it succeeds, we
+            # hold the only reference to that path, so renaming our staged
+            # copy onto it is guaranteed race-free.
+            os.mkdir(dest)
+        except OSError:
+            # Lost the race - dest already exists (empty or not), created
+            # by senko itself or another bootstrap. Never touch it; just
+            # discard the staging copy.
+            shutil.rmtree(staging, ignore_errors=True)
+            staging = None
+            return False
+
+        try:
             os.rename(staging, dest)
         except OSError:
-            # Lost the race (dest was created concurrently, e.g. by
-            # another process's rename landing first) or dest already
-            # exists as a non-empty dir from senko's own mkdir - either
-            # way, never touch dest ourselves; just discard the staging
-            # copy.
+            # Should not happen (we just created dest ourselves and hold
+            # the only reference to it), but fail soft regardless rather
+            # than ever raising out of a bootstrap.
             shutil.rmtree(staging, ignore_errors=True)
             staging = None
             return False

@@ -226,12 +226,19 @@ class TestBootstrapSenkoCacheIfEmpty:
         assert (senko_cache_dir / "cache_index.pyc.i.json").read_text() == '{"fake": "index"}'
         assert (senko_cache_dir / "subdir" / "artifact.nbi").read_bytes() == b"\x00\x01\x02"
 
-    def test_present_canonical_dir_copied_in_when_dest_exists_but_empty(
+    def test_present_but_empty_dest_is_left_untouched_not_bootstrapped(
         self, canonical_root, senko_cache_dir
     ):
         """senko itself does cache_dir.mkdir(parents=True, exist_ok=True)
-        unconditionally - the real dest dir may already exist as an empty
-        directory (created by senko or a previous no-op run)."""
+        unconditionally BEFORE writing its first cache file - so an
+        existing-but-empty dest is not distinguishable from "senko just
+        created this and is about to populate it". Bootstrapping into it
+        here would risk replacing the exact directory instance senko is
+        mid-write into (POSIX os.rename silently succeeds when the target
+        is an existing empty directory). So this must now be a strict
+        no-op that leaves the empty dir exactly as found, never claiming
+        it - the only safe behaviour once dest exists at all, populated or
+        not."""
         key = "goodkey2"
         source = canonical_root / key
         source.mkdir(parents=True)
@@ -241,8 +248,8 @@ class TestBootstrapSenkoCacheIfEmpty:
 
         result = numba_cache.bootstrap_senko_cache_if_empty(key=key)
 
-        assert result is True
-        assert (senko_cache_dir / "warm.txt").read_text() == "warm"
+        assert result is False
+        assert list(senko_cache_dir.iterdir()) == []
 
     def test_never_touches_already_warm_real_cache_dir(self, canonical_root, senko_cache_dir):
         """THE critical invariant: if the real senko cache dir already has
@@ -372,6 +379,51 @@ class TestConcurrentBootstrapNeverLeavesPartialDest:
             if p.name.startswith(".") and "bootstrap" in p.name
         ]
         assert leftovers == []
+
+    def test_never_replaces_a_dest_dir_another_actor_just_created_empty(
+        self, canonical_root, senko_cache_dir, monkeypatch
+    ):
+        """Regression for the finding: POSIX os.rename() silently succeeds
+        (replacing the target) when dest already exists as an EMPTY
+        directory. That means a naive final `os.rename(staging, dest)`
+        could win a race against senko's own
+        `cache_dir.mkdir(parents=True, exist_ok=True)` - replacing the
+        exact directory senko is about to write its first real cache file
+        into, with no error on either side. This simulates that: after
+        bootstrap has verified dest is empty and finished staging its
+        copy, but BEFORE its final claim step, another actor (standing in
+        for senko itself) creates dest fresh and is about to populate it.
+        Bootstrap's claim step must fail and back off - dest must be left
+        exactly as the other actor made it, never silently replaced."""
+        key = "claimracekey"
+        source = canonical_root / key
+        source.mkdir(parents=True)
+        (source / "warm.txt").write_text("warm-from-canonical")
+
+        original_mkdir = os.mkdir
+        other_actor_created = {"done": False}
+
+        def mkdir_then_let_other_actor_win(path, *args, **kwargs):
+            # This is bootstrap's own claim-via-mkdir call. Before it runs,
+            # simulate another process/thread (e.g. senko itself) creating
+            # dest first - so bootstrap's mkdir must now fail.
+            if not other_actor_created["done"] and str(path) == str(senko_cache_dir):
+                other_actor_created["done"] = True
+                original_mkdir(senko_cache_dir)
+                (senko_cache_dir / "senkos-own-file.marker").write_text(
+                    "written by the other actor, not bootstrap"
+                )
+            return original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "mkdir", mkdir_then_let_other_actor_win)
+
+        result = numba_cache.bootstrap_senko_cache_if_empty(key=key)
+
+        assert result is False
+        # dest must still be exactly what the other actor wrote - never
+        # replaced by bootstrap's staged canonical copy.
+        assert (senko_cache_dir / "senkos-own-file.marker").exists()
+        assert not (senko_cache_dir / "warm.txt").exists()
 
 
 # ---------------------------------------------------------------------------
