@@ -246,8 +246,26 @@ class SortformerDiarizer:
         Copy model to local path, resolving all symlinks.
 
         HuggingFace cache uses symlinks which can cause issues with CoreML compilation.
+
+        Concurrency: this local cache dir (``<repo>/models/<model_name>``) is
+        shared by every process using the sortformer backend on this
+        machine - same failure shape as the numba cache in numba_cache.py.
+        Two concurrent sortformer runs can both observe the destination
+        missing/incomplete and both start copying into the SAME
+        ``local_model_path`` at once, interleaving writes and potentially
+        leaving a torn ``Manifest.json`` or model file that a third reader
+        (or CoreML itself) then loads. To avoid that, the copy always
+        lands in a private, per-call staging directory first and is only
+        made visible via a single atomic ``os.rename`` - mirroring the
+        staging-then-rename pattern in
+        ``numba_cache.bootstrap_senko_cache_if_empty``. A run that loses
+        the race simply discards its staging copy and reuses whatever
+        finished first.
         """
+        import os
         import shutil
+        import threading
+        import uuid
         from pathlib import Path
 
         model_path = Path(model_path)
@@ -258,20 +276,82 @@ class SortformerDiarizer:
         local_dir.mkdir(exist_ok=True)
         local_model_path = local_dir / model_name
 
-        if local_model_path.exists():
-            # Check if it's complete (has Manifest.json)
-            if (local_model_path / "Manifest.json").exists():
-                print(f"  Using cached model: {local_model_path}")
-                return str(local_model_path)
-            else:
-                # Incomplete - remove and re-copy
-                shutil.rmtree(local_model_path)
+        def _is_complete(p: Path) -> bool:
+            return (p / "Manifest.json").exists()
 
+        if local_model_path.exists() and _is_complete(local_model_path):
+            print(f"  Using cached model: {local_model_path}")
+            return str(local_model_path)
+
+        # Either missing entirely, or present-but-incomplete (a previous
+        # copy that never finished/lost the race). Never rmtree an
+        # incomplete dir in place - another process could be mid-copy into
+        # it right now, or a concurrent racer's rename could land at any
+        # moment. Copy into an isolated staging dir and let a single
+        # atomic os.rename decide the winner - never pre-clear the
+        # destination ourselves, since that would reopen exactly the race
+        # window this is meant to close (two threads could both observe
+        # "cleared" and both rename successfully, the second silently
+        # clobbering the first mid-flight from another reader's point of
+        # view).
         print(f"  Copying model to local cache (resolving symlinks)...")
-        # Copy with symlinks followed (default behavior of copytree)
-        shutil.copytree(model_path, local_model_path, symlinks=False)
-        print(f"  Model copied to: {local_model_path}")
+        unique = f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}"
+        staging = local_dir / f".{model_name}.staging-{unique}"
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            # Copy with symlinks followed (default behavior of copytree)
+            shutil.copytree(model_path, staging, symlinks=False)
 
+            if local_model_path.exists() and _is_complete(local_model_path):
+                # Someone else finished (or was already complete) while we
+                # were copying - use theirs, discard ours.
+                shutil.rmtree(staging, ignore_errors=True)
+                print(f"  Using cached model (completed concurrently): {local_model_path}")
+                return str(local_model_path)
+
+            try:
+                # os.rename can't atomically replace a non-empty
+                # directory on POSIX, so if an incomplete dest is still
+                # sitting there we move IT aside (also an atomic rename,
+                # to a name no other racer can guess) before installing
+                # our own copy. NOTE: unlike the mkdir-claim technique
+                # used in numba_cache.bootstrap_senko_cache_if_empty, this
+                # two-step aside-then-in swap does have a real (if narrow)
+                # window between the two renames where local_model_path is
+                # observably missing from disk - verified empirically. That
+                # window is only reachable by another invocation of THIS
+                # function, and every caller here only ever acts on
+                # local_model_path after first confirming _is_complete(),
+                # and dest is only ever moved aside when it was already
+                # confirmed incomplete - so no code path in this module
+                # currently treats a momentarily-missing dest as an error.
+                # If a future caller starts reading dest without going
+                # through _is_complete()/_prepare_local_model, this window
+                # would need closing (e.g. via the mkdir-claim pattern).
+                if local_model_path.exists():
+                    aside = local_dir / f".{model_name}.stale-{unique}"
+                    os.rename(local_model_path, aside)
+                    shutil.rmtree(aside, ignore_errors=True)
+                os.rename(staging, local_model_path)
+            except OSError:
+                # Lost the race to another process's rename landing first
+                # in the gap between our completeness check above and our
+                # own rename. If the winner's copy is complete, use it and
+                # discard our own staging copy (never leak it); otherwise
+                # this is a genuinely unexpected state (e.g. permissions) -
+                # surface it by re-raising rather than silently returning
+                # an orphaned staging path no caller can find again.
+                if local_model_path.exists() and _is_complete(local_model_path):
+                    shutil.rmtree(staging, ignore_errors=True)
+                    print(f"  Using cached model (completed concurrently): {local_model_path}")
+                    return str(local_model_path)
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        print(f"  Model copied to: {local_model_path}")
         return str(local_model_path)
 
     def _init_state(self) -> StreamingState:
