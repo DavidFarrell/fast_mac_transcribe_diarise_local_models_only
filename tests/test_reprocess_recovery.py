@@ -52,7 +52,7 @@ def _patch_common(monkeypatch, segments, transcripts_by_path, file_duration=120.
 
     monkeypatch.setattr(reprocess, "is_wav_16k_mono", lambda path: True)
     monkeypatch.setattr(reprocess, "get_audio_duration", lambda path: file_duration)
-    monkeypatch.setattr(reprocess, "ASRModel", lambda model_id: fake_asr)
+    monkeypatch.setattr(reprocess, "ASRModel", lambda model_id, device="auto": fake_asr)
     monkeypatch.setattr(
         reprocess,
         "SenkoDiarizer",
