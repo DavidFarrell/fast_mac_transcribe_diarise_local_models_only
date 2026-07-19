@@ -30,6 +30,14 @@ fast-transcribe and blogify skill texts work unchanged on both machines.
 5. **GPU is temporarily unavailable** (driver/module mismatch until David
    reboots). Everything must ALSO run on CPU: build + verify CPU-first, keep
    the device flag, GPU verification is the final pending step.
+   **Scope ruling (19 Jul, after the kaldifeat finding): the frozen
+   "uv sync is the whole install contract" applies to the CPU DEFAULT
+   install only.** CUDA provisioning (senko's [nvidia] extras incl.
+   kaldifeat, which needs cmake and possibly toolkit pieces uv cannot
+   supply) is an explicit, scripted GPU-gate step documented in
+   design/gpu-provisioning.md - try uv-installable tools (e.g. pip cmake)
+   first; anything needing apt/sudo is a named David-step executed at
+   reboot time, never assumed.
 6. **Secrets/gates:** pyannote weights may be HF-gated. No tokens in the repo.
    If a gate is hit, stop and route the token step to David via yoshimi.
 
