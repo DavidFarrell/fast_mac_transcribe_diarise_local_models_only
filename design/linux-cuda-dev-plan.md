@@ -86,10 +86,14 @@ cli.py, audio.py, asr.py, merge.py), not only diarisation.py:
 - Keep: standalone-only numba_cache.py and its recent fixes - 65c7eab
   (concurrency hardening + silent-audio), 524db9c (--warm-cache), 10bdd8f
   (UTF-8 ffmpeg stderr).
-- Danger zone: diarisation.py differs by 741 lines (senko_diarisation.py 218,
-  cli.py 114, audio.py 61, asr.py 29, merge.py 5). The reconciled
-  diarisation.py gets its OWN dedicated GPT-5 review round in this slice's
-  loop, separate from the slice-level review.
+- Danger zone (relabelled after analysis): diarisation.py's 741-line diff is
+  a near-total clean DELETION (Sortformer retirement) - the REAL hand-merge
+  risk is senko_diarisation.py (~220 lines, two parallel-evolved concurrency
+  fixes that act on different failure boundaries and must BOTH survive:
+  standalone's _patch_numba_cache cross-process cache I/O + embedded's
+  _restore_numba_njit retry). Analysis + per-file resolutions + GPT-5 second
+  opinion (READY TO SHIP): design/slice0.5-reconciliation-analysis.md - the
+  merge-builder executes THAT document.
 - Both entry-point contracts are preserved and smoke-tested (as far as CPU +
   current deps allow): `diarise-transcribe --in/--out` AND
   `python -m diarise_transcribe.reprocess <folder> --stream both` JSONL.
@@ -103,13 +107,18 @@ cli.py, audio.py, asr.py, merge.py), not only diarisation.py:
   so it does not merge into linux-cuda until the Mac run is green.
 
 Exit: reconciled tree on linux-cuda; existing deterministic tests still
-green PLUS new focused deterministic regressions for the mic PTS anchor and
-ASR recovery fault-isolation behaviors; a model-stubbed two-stream
-`reprocess --stream both` run validating the JSONL event/turn contract
-without loading real models; proof retired Sortformer code is not selectable
-or imported; both CLIs importable and showing --help on Linux
-(real-model paths may still fail pending Slices 1-3); reconciliation
-decisions recorded in design/slice0.5-reconciliation.md.
+green (with the two retired-path test changes the analysis names) PLUS the
+embedded regression tests carried in (test_write_aligned_audio.py = mic PTS
+accounting, test_recovery.py + test_reprocess_recovery.py = recovery
+fault-isolation); a model-stubbed two-stream `reprocess --stream both` run
+validating the JSONL event/turn contract without loading real models
+(seam: the _patch_common pattern in test_reprocess_recovery.py); proof
+retired Sortformer code is not selectable or imported. CLI checks (boss
+ruling on S2, 19 Jul): Linux `--help` is NOT an 0.5 criterion - asr.py's
+module-top MLX import makes it unreachable until Slice 2's lazy-import work;
+0.5 verifies imports on Linux up to the asr seam, and the Mac-side --help +
+reference run happen in the macbase gate. Reconciliation decisions recorded
+in design/slice0.5-reconciliation.md.
 
 ## Slice 1 - packaging split
 
