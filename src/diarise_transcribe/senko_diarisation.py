@@ -19,6 +19,26 @@ _native_diarizer_cache_lock = threading.Lock()
 _senko_import_lock = threading.Lock()
 
 
+def _diarization_used_cuda(device: str) -> bool:
+    """Whether a Senko diarisation on `device` ran on CUDA.
+
+    'cuda' always does; 'auto' does when torch reports CUDA usable (Senko's
+    own auto rule); 'cpu'/'coreml'/anything else does not. Used to poison
+    co-resident ASR models - see asr.poison_cuda_asr and
+    design/gpu-verification.md.
+    """
+    if device == "cuda":
+        return True
+    if device == "auto":
+        try:
+            import torch
+
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+    return False
+
+
 def _restore_numba_njit(senko_module: Any) -> None:
     """
     Senko globally patches numba.njit(cache=True), which can make UMAP/HDBSCAN
@@ -259,6 +279,14 @@ class SenkoDiarizer:
                 raise
         else:
             raise RuntimeError("Senko diarisation did not produce a result.")
+
+        # This diarisation just did CUDA work (if it ran on CUDA), which
+        # poisons the CUDA state of any co-resident ASR model. Signal that so
+        # the next ASR transcribe reloads a fresh model instead of crashing.
+        if _diarization_used_cuda(self._device):
+            from . import asr
+
+            asr.poison_cuda_asr()
 
         # Senko can return None / empty output for silent inputs.
         if not result:
