@@ -1,8 +1,9 @@
 """
-Speaker diarisation using Senko on Apple Silicon.
+Speaker diarisation using Senko.
 
-Senko uses CoreML for both VAD (pyannote segmentation-3.0) and speaker
-embeddings (CAM++), running on the Apple Neural Engine.
+Platform-neutral: the ``device`` given at construction is forwarded to
+``senko.Diarizer`` unchanged, and Senko resolves it (CoreML on Apple
+Silicon, CUDA or CPU on Linux). This module makes no platform assumptions.
 
 Reference: https://github.com/narcotic-sh/senko
 """
@@ -45,10 +46,10 @@ def _import_senko() -> Any:
 
 class SenkoDiarizer:
     """
-    CoreML-based speaker diarizer using Senko.
+    Speaker diarizer wrapping Senko.
 
-    Senko provides efficient speaker diarisation on Apple Silicon,
-    processing ~1 hour of audio in ~7.7 seconds on M3.
+    The ``device`` given at construction is forwarded to ``senko.Diarizer``
+    unchanged; Senko selects the compute backend from it.
     """
 
     def __init__(
@@ -56,12 +57,14 @@ class SenkoDiarizer:
         device: str = "auto",
         warmup: bool = False,
         quiet: bool = False,
-    ):
+    ) -> None:
         """
         Initialize the Senko diarizer.
 
         Args:
-            device: Computation device ('auto', 'cuda', 'cpu', 'coreml')
+            device: Computation device, forwarded verbatim to Senko (which
+                resolves it). Senko's values: 'auto', 'cuda', 'cpu', 'coreml'.
+                This wrapper does not resolve or validate it.
             warmup: Whether to warm up models during initialization
             quiet: Suppress console output
         """
@@ -269,12 +272,15 @@ class SenkoDiarizer:
                 print("No speakers detected in the audio.")
             return []
 
-        # Convert Senko segments to our DiarSegment format
+        # Convert Senko segments to our DiarSegment format, in Senko's own
+        # order. Coerce the timestamps to float so DiarSegment carries its
+        # declared float type regardless of what Senko returns (the frozen
+        # turn schema has float t0/t1).
         segments = []
         for seg in merged_segments:
             segments.append(DiarSegment(
-                start=seg["start"],
-                end=seg["end"],
+                start=float(seg["start"]),
+                end=float(seg["end"]),
                 speaker=seg["speaker"],
             ))
 

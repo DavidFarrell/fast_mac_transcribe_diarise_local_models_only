@@ -23,7 +23,9 @@ so any read failure degrades to "cache miss" (recompile that function)
 instead of crashing.
 """
 
+import math
 import types
+from pathlib import Path
 from unittest import mock
 
 import numba
@@ -475,3 +477,149 @@ def test_diarise_retries_once_after_transient_reference_error(monkeypatch) -> No
     assert [(segment.start, segment.end, segment.speaker) for segment in segments] == [
         (0.0, 1.25, "SPEAKER_01"),
     ]
+
+
+def _fake_senko_capturing(captured: dict) -> type:
+    """Fake senko module whose Diarizer records the device it was built with."""
+
+    class _FakeNativeDiarizer:
+        def diarize(self, _audio_path, generate_colors=False):
+            return {
+                "merged_segments": [
+                    {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+                ],
+                "merged_speakers_detected": 1,
+            }
+
+    class _FakeSenkoModule:
+        class config:
+            _original_njit = numba.njit
+
+        @staticmethod
+        def Diarizer(device, warmup, quiet):
+            captured["device"] = device
+            return _FakeNativeDiarizer()
+
+    return _FakeSenkoModule
+
+
+class TestDeviceForwarding:
+    @pytest.mark.parametrize("device", ["cpu", "cuda", "auto", "coreml"])
+    def test_device_forwarded_verbatim_to_senko(self, monkeypatch, device):
+        """The given device reaches senko.Diarizer unchanged - a wrapper that
+        hardcoded or rewrote it (a darwin assumption) would fail this."""
+        senko_diarisation._native_diarizer_cache.clear()
+        captured: dict = {}
+        monkeypatch.setattr(
+            senko_diarisation, "_import_senko", lambda: _fake_senko_capturing(captured)
+        )
+
+        SenkoDiarizer(device=device, quiet=True).diarise("x.wav")
+
+        assert captured["device"] == device
+
+    def test_default_device_is_auto(self, monkeypatch):
+        """Unspecified device forwards Senko's own 'auto', not a hardcoded one."""
+        senko_diarisation._native_diarizer_cache.clear()
+        captured: dict = {}
+        monkeypatch.setattr(
+            senko_diarisation, "_import_senko", lambda: _fake_senko_capturing(captured)
+        )
+
+        SenkoDiarizer(quiet=True).diarise("x.wav")
+
+        assert captured["device"] == "auto"
+
+
+def _diarizer_returning(merged_segments: list) -> SenkoDiarizer:
+    """A SenkoDiarizer preset to return these merged_segments (no real senko)."""
+
+    class _Fake:
+        def diarize(self, _p, generate_colors=False):
+            return {
+                "merged_segments": merged_segments,
+                "merged_speakers_detected": len({s["speaker"] for s in merged_segments}),
+            }
+
+    diarizer = SenkoDiarizer(quiet=True)
+    diarizer._diarizer = _Fake()
+    return diarizer
+
+
+class TestSegmentConversion:
+    def test_preserves_senko_segment_order(self):
+        """Conversion keeps Senko's order 1:1. Input is deliberately NOT
+        chronological, so a stray sort() in the wrapper would fail this."""
+        segments = _diarizer_returning(
+            [
+                {"start": 3.25, "end": 4.0, "speaker": "SPEAKER_00"},
+                {"start": 0.0, "end": 1.5, "speaker": "SPEAKER_02"},
+                {"start": 1.5, "end": 3.25, "speaker": "SPEAKER_01"},
+            ]
+        ).diarise("x.wav")
+
+        assert [(s.start, s.end, s.speaker) for s in segments] == [
+            (3.25, 4.0, "SPEAKER_00"),
+            (0.0, 1.5, "SPEAKER_02"),
+            (1.5, 3.25, "SPEAKER_01"),
+        ]
+        for s in segments:
+            assert isinstance(s.speaker, str) and s.speaker  # nonempty speaker id
+            assert 0 <= s.start < s.end  # per-segment ordering invariant
+
+    def test_timestamps_coerced_to_float_from_integer_input(self):
+        """start/end must be floats even from integer input - math.isfinite
+        alone accepts ints, so this is what enforces the float contract."""
+        segments = _diarizer_returning(
+            [{"start": 0, "end": 2, "speaker": "SPEAKER_00"}]
+        ).diarise("x.wav")
+
+        (s,) = segments
+        assert isinstance(s.start, float) and isinstance(s.end, float)
+        assert math.isfinite(s.start) and math.isfinite(s.end)
+        assert (s.start, s.end) == (0.0, 2.0)
+
+
+@pytest.mark.integration
+def test_real_senko_cpu_run_on_golden_mic_stream(tmp_path):
+    """Real senko CPU run on the committed golden mic stream. The fixture and
+    ffmpeg are asserted (not skipped) so the gate cannot pass without them."""
+    import shutil
+    import subprocess
+    import wave
+
+    src = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "golden"
+        / "meeting"
+        / "audio"
+        / "mic.wav"
+    )
+    assert src.exists(), f"committed golden fixture missing: {src}"
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg, "ffmpeg is required to run the senko integration gate"
+
+    # Senko rejects anything but 16 kHz mono 16-bit WAV (it does not resample);
+    # convert into pytest's tmp_path so the test owns its input.
+    wav16k = tmp_path / "mic_16k.wav"
+    subprocess.run(
+        [ffmpeg, "-y", "-i", str(src), "-ar", "16000", "-ac", "1", str(wav16k)],
+        check=True,
+        capture_output=True,
+    )
+    with wave.open(str(wav16k)) as w:
+        duration = w.getnframes() / w.getframerate()
+
+    segments = SenkoDiarizer(device="cpu", quiet=True).diarise(str(wav16k))
+
+    assert segments, "expected nonempty diarisation on the golden mic stream"
+
+    starts = [s.start for s in segments]
+    assert starts == sorted(starts), "segments must be in non-decreasing start order"
+
+    for s in segments:
+        assert isinstance(s.speaker, str) and s.speaker  # nonempty speaker id
+        assert isinstance(s.start, float) and isinstance(s.end, float)  # floats
+        assert math.isfinite(s.start) and math.isfinite(s.end)  # finite
+        assert 0 <= s.start < s.end <= duration  # 0 <= start < end <= duration
