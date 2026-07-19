@@ -21,9 +21,32 @@ from typing import Any, Callable, List, NamedTuple, Optional
 # Cache of loaded models keyed by (model_id, device), so repeated ASRModel
 # instances for the same model reuse one in-memory model instead of
 # re-deserialising it. Bounded by the number of distinct (id, device) pairs
-# used in a process - in practice 1.
-_model_cache: dict[tuple[str, str], Any] = {}
+# used in a process - in practice 1. Each entry is (model, generation): the
+# generation it was loaded at, for the CUDA-poison invalidation below.
+_model_cache: dict[tuple[str, str], tuple[Any, int]] = {}
 _model_cache_lock = threading.Lock()
+
+# CUDA co-residency poison generation. Senko's CUDA diarisation irrecoverably
+# corrupts the CUDA state of any co-resident model (a torch/kaldifeat bug -
+# see design/gpu-verification.md; the Mac's CoreML path never hits it), so a
+# NeMo model transcribed after a CUDA diarisation dies with an illegal memory
+# access. senko_diarisation calls poison_cuda_asr() after any CUDA diarise;
+# an ASRModel whose model was loaded at an older generation reloads a fresh
+# one before transcribing. On CPU/darwin senko never runs on CUDA, so this is
+# never called, the generation stays 0, and model reuse is byte-identical to
+# before - no device resolution, no torch import on the cache path.
+_cuda_asr_generation = 0
+
+
+def poison_cuda_asr() -> None:
+    """Mark every currently-loaded ASR model as CUDA-poisoned (see above).
+
+    Called by senko_diarisation after a diarisation that ran on CUDA. The
+    next transcribe on any model loaded before this call reloads a fresh one.
+    """
+    global _cuda_asr_generation
+    with _model_cache_lock:
+        _cuda_asr_generation += 1
 
 
 @dataclass
@@ -193,19 +216,30 @@ class ASRModel:
         self.device = device
         self._backend = _select_backend()
         self._model = None
+        self._loaded_generation = None
 
     def _ensure_loaded(self):
-        """Lazy load the model on first use, reusing a process-wide cache."""
-        if self._model is not None:
+        """Lazy load the model on first use, reusing a process-wide cache.
+
+        Reloads if a CUDA diarisation has poisoned co-resident models since
+        this instance's model was loaded (see poison_cuda_asr). When no CUDA
+        diarisation has occurred the generation is unchanged and this is the
+        original reuse-one-cached-model behaviour.
+        """
+        if self._model is not None and self._loaded_generation == _cuda_asr_generation:
             return
 
         key = (self.model_id, self.device)
         with _model_cache_lock:
+            generation = _cuda_asr_generation
             cached = _model_cache.get(key)
-            if cached is None:
-                cached = self._backend.load(self.model_id, self.device)
-                _model_cache[key] = cached
-            self._model = cached
+            if cached is None or cached[1] != generation:
+                model = self._backend.load(self.model_id, self.device)
+                _model_cache[key] = (model, generation)
+            else:
+                model = cached[0]
+            self._model = model
+            self._loaded_generation = generation
 
     def transcribe(
         self,
