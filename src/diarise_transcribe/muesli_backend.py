@@ -346,6 +346,7 @@ def run_pipeline(
     timestamp_offset: float = 0.0,
     live_asr_only: bool = False,
     stream_label: Optional[str] = None,
+    device: str = "auto",
 ) -> "MergedTranscript":
     temp_wav = None
     delete_temp = False
@@ -360,7 +361,7 @@ def run_pipeline(
 
     try:
         log(f"Running ASR with {asr_model}...", verbose)
-        asr = ASRModel(asr_model)
+        asr = ASRModel(asr_model, device=device)
         transcript = asr.transcribe(temp_wav, language=language)
         if timestamp_offset:
             for word in transcript.words:
@@ -373,7 +374,7 @@ def run_pipeline(
         elif diar_backend == "senko":
             log("Running diarisation with Senko...", verbose)
             from .senko_diarisation import SenkoDiarizer
-            diarizer = SenkoDiarizer(quiet=not verbose)
+            diarizer = SenkoDiarizer(device=device, quiet=not verbose)
             segments = diarizer.diarise(temp_wav)
         else:
             raise ValueError(

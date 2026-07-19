@@ -190,6 +190,7 @@ def run_pipeline(
     speaker_tolerance: float = DEFAULT_SPEAKER_TOLERANCE_SECONDS,
     keep_temp: bool = False,
     verbose: bool = False,
+    device: str = "auto",
 ) -> None:
     """
     Run the full transcription + diarisation pipeline.
@@ -208,6 +209,10 @@ def run_pipeline(
         speaker_tolerance: Tolerance for speaker assignment
         keep_temp: Keep temporary files
         verbose: Verbose output
+        device: Compute device forwarded to BOTH ASR and diarisation
+            ('auto', 'cuda', 'cpu'); each backend resolves it (see ASRModel /
+            SenkoDiarizer). Defaults to 'auto', so the CLI behaviour is
+            unchanged.
     """
     # Validate that at least one output is specified
     if not any([output_text, output_json, output_srt, output_rttm]):
@@ -239,7 +244,7 @@ def run_pipeline(
     try:
         # Step 2: Run ASR
         print(f"\n[2/4] Running ASR with {asr_model}...")
-        asr = ASRModel(asr_model)
+        asr = ASRModel(asr_model, device=device)
         transcript = asr.transcribe(temp_wav, language=language)
         print(f"  Transcribed {len(transcript.words)} words")
         if verbose and transcript.text:
@@ -250,7 +255,7 @@ def run_pipeline(
         if diar_backend == "senko":
             print("\n[3/4] Running diarisation with Senko (pyannote+CAM++ CoreML)...")
             from .senko_diarisation import SenkoDiarizer
-            diarizer = SenkoDiarizer(quiet=not verbose)
+            diarizer = SenkoDiarizer(device=device, quiet=not verbose)
             segments = diarizer.diarise(temp_wav)
         else:
             raise ValueError(

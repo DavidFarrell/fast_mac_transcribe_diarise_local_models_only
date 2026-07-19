@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 import traceback
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import List, Optional
 
@@ -220,6 +221,7 @@ def reprocess_stream(
     speaker_tolerance: float,
     verbose: bool,
     recovery: bool = True,
+    device: str = "auto",
 ) -> dict:
     def log(msg: str) -> None:
         if verbose:
@@ -240,14 +242,20 @@ def reprocess_stream(
     try:
         emit_status("transcribing", stream_name)
         log(f"Running ASR with {asr_model}...")
-        asr = ASRModel(asr_model)
+        asr = ASRModel(asr_model, device=device)
         transcript = asr.transcribe(temp_wav, language=language)
 
         emit_status("diarizing", stream_name)
         if diar_backend == "senko":
             log("Running Senko diarization (batch)...")
-            diarizer = SenkoDiarizer(quiet=not verbose)
-            segments = diarizer.diarise(temp_wav)
+            diarizer = SenkoDiarizer(device=device, quiet=not verbose)
+            # Senko's progress prints (quiet=False under --verbose) and its own
+            # internal chatter go to stdout; force them to stderr so this
+            # entry point's stdout stays pure JSONL, matching the NeMo
+            # backend's redirect (asr_nemo.py). This path is synchronous, so
+            # swapping the process-wide sys.stdout here is safe.
+            with redirect_stdout(sys.stderr):
+                segments = diarizer.diarise(temp_wav)
         else:
             raise ValueError(
                 f"Unknown diar_backend {diar_backend!r}: only 'senko' is supported "
