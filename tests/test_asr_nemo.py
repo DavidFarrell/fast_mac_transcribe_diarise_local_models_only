@@ -1,9 +1,13 @@
 """
-Linux NeMo backend units: the device resolver and the timestamp conversion.
+Linux NeMo backend units: the device resolver, timestamp conversion, and
+model-id source resolution.
 
 Deterministic - the resolver takes an injected cuda-availability predicate so
-torch is never imported; the conversion runs on captured NeMo word shapes.
+torch is never imported; the conversion runs on captured NeMo word shapes;
+source resolution stubs snapshot_download so no network or nemo is needed.
 """
+
+import types
 
 import pytest
 
@@ -66,3 +70,46 @@ def test_conversion_ignores_offset_keys_and_coerces_floats() -> None:
 
     assert isinstance(words[0].start, float)
     assert words[0].start == 1.0 and words[0].end == 2.0
+
+
+# --- model-id source resolution --------------------------------------------
+
+def _stub_snapshot_download(monkeypatch, tmp_path, chatter=None):
+    """Fake huggingface_hub.snapshot_download that drops the pinned .nemo."""
+    (tmp_path / asr_nemo._DEFAULT_NEMO_FILENAME).write_text("")
+
+    def fake_download(model_id, revision=None, allow_patterns=None):
+        if chatter:
+            print(chatter)  # simulate cold-cache progress on stdout
+        return str(tmp_path)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.snapshot_download = fake_download
+    monkeypatch.setitem(__import__("sys").modules, "huggingface_hub", fake_hub)
+
+
+def test_non_default_id_passes_through_verbatim() -> None:
+    # Local paths and other-org ids reach restore_from unchanged (frozen rule).
+    assert asr_nemo._resolve_nemo_source("/models/custom.nemo") == "/models/custom.nemo"
+    assert asr_nemo._resolve_nemo_source("some-org/asr") == "some-org/asr"
+
+
+def test_default_id_resolves_to_pinned_nemo_file(monkeypatch, tmp_path) -> None:
+    _stub_snapshot_download(monkeypatch, tmp_path)
+
+    source = asr_nemo._resolve_nemo_source(asr.DEFAULT_MODEL_NEMO)
+
+    assert source.endswith(asr_nemo._DEFAULT_NEMO_FILENAME)
+    assert source == str(tmp_path / asr_nemo._DEFAULT_NEMO_FILENAME)
+
+
+def test_snapshot_download_output_goes_to_stderr_not_stdout(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _stub_snapshot_download(monkeypatch, tmp_path, chatter="DOWNLOAD_PROGRESS_42")
+
+    asr_nemo._resolve_nemo_source(asr.DEFAULT_MODEL_NEMO)
+
+    captured = capsys.readouterr()
+    assert "DOWNLOAD_PROGRESS_42" not in captured.out
+    assert "DOWNLOAD_PROGRESS_42" in captured.err

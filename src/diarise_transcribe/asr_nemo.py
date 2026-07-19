@@ -11,7 +11,6 @@ bars, INFO logs) is forced to stderr, because the reprocess entry point writes
 its JSONL event stream to stdout.
 """
 
-import glob
 import logging
 import os
 import sys
@@ -77,41 +76,48 @@ def nemo_words_to_words(nemo_words: List[dict]) -> List[Word]:
     ]
 
 
+# The single .nemo artifact inside the pinned nvidia/parakeet-tdt-0.6b-v3
+# snapshot (revision is immutable, so the filename is fixed).
+_DEFAULT_NEMO_FILENAME = "parakeet-tdt-0.6b-v3.nemo"
+
+
 def _resolve_nemo_source(model_id: str) -> str:
     """
-    Map a model id to a local .nemo path to restore from.
+    Map a model id to what restore_from should load.
 
-    The default nvidia model is fetched at its pinned immutable revision. A
-    local .nemo file (or a directory containing one) is used verbatim. Any
-    other id is passed through unchanged for restore_from to resolve or fail
-    on - the frozen id rule keeps custom ids as backend-error passthrough.
+    Only the default nvidia id is resolved - to its pinned immutable revision's
+    exact .nemo file. Every other id (local .nemo paths, custom ids, other
+    orgs) is returned verbatim per the frozen id rule; restore_from then loads
+    or errors on it, and that backend error propagates untouched.
+
+    The download is inside redirect_stdout so a cold-cache fetch cannot
+    contaminate the JSONL stdout stream.
     """
-    if model_id == DEFAULT_MODEL_NEMO:
-        from huggingface_hub import snapshot_download
+    if model_id != DEFAULT_MODEL_NEMO:
+        return model_id
 
+    from huggingface_hub import snapshot_download
+
+    with redirect_stdout(sys.stderr):
         local = snapshot_download(
             model_id, revision=DEFAULT_REVISION, allow_patterns=["*.nemo"]
         )
-        matches = glob.glob(os.path.join(local, "*.nemo"))
-        if not matches:
-            raise RuntimeError(
-                f"No .nemo file in the pinned snapshot of {model_id}."
-            )
-        return matches[0]
-    if os.path.isdir(model_id):
-        matches = glob.glob(os.path.join(model_id, "*.nemo"))
-        if matches:
-            return matches[0]
-    return model_id
+    source = os.path.join(local, _DEFAULT_NEMO_FILENAME)
+    if not os.path.isfile(source):
+        raise RuntimeError(
+            f"Pinned snapshot of {model_id} is missing {_DEFAULT_NEMO_FILENAME}."
+        )
+    return source
 
 
 def load_model(model_id: str, device: str) -> Any:
     """Load a parakeet-tdt NeMo model onto the resolved device."""
     resolved = resolve_device(device)
-    source = _resolve_nemo_source(model_id)
 
-    # NeMo/torch emit load logs and progress to stdout; keep stdout pure JSONL.
+    # NeMo/torch emit load logs and download progress to stdout; keep stdout
+    # pure JSONL by forcing all of it - source resolution included - to stderr.
     with redirect_stdout(sys.stderr):
+        source = _resolve_nemo_source(model_id)
         logging.getLogger("nemo_logger").handlers = [
             logging.StreamHandler(sys.stderr)
         ]

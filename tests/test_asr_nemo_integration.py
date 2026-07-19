@@ -58,6 +58,10 @@ def test_cpu_transcription_smoke(tmp_path) -> None:
         math.isfinite(w.start) and math.isfinite(w.end) and 0 <= w.start <= w.end
         for w in result.words
     )
+    # Word start times are monotonically nondecreasing - diarisation alignment
+    # downstream depends on it, so a reordering regression must fail here.
+    starts = [w.start for w in result.words]
+    assert starts == sorted(starts), "word start times not nondecreasing"
 
     # Text overlaps the known system script well above chance.
     hyp, ref = _words(result.text), _words(_SYSTEM_SCRIPT)

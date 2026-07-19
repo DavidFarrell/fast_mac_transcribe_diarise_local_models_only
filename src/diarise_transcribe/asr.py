@@ -237,6 +237,7 @@ def transcribe_audio(
     audio_path: str,
     model_id: str = DEFAULT_MODEL,
     language: Optional[str] = None,
+    device: str = "auto",
 ) -> TranscriptResult:
     """
     Convenience function to transcribe audio.
@@ -245,6 +246,7 @@ def transcribe_audio(
         audio_path: Path to 16kHz mono WAV file
         model_id: model id for the active platform's backend
         language: Language code (auto-detected if None)
+        device: 'auto', 'cuda' or 'cpu' (see ASRModel)
     """
-    model = ASRModel(model_id)
+    model = ASRModel(model_id, device=device)
     return model.transcribe(audio_path, language=language)

@@ -76,6 +76,25 @@ def test_device_forwarded_to_backend_load(monkeypatch) -> None:
     assert seen == [("some-org/custom-asr", "cpu")]
 
 
+def test_transcribe_audio_forwards_device(monkeypatch) -> None:
+    asr._model_cache.clear()
+    seen: list[tuple[str, str]] = []
+
+    def fake_load(model_id: str, device: str):
+        seen.append((model_id, device))
+        return object()
+
+    def fake_transcribe(model, audio_path, **kwargs):
+        return asr.TranscriptResult(text="", words=[])
+
+    backend = asr._Backend(load=fake_load, transcribe=fake_transcribe)
+    monkeypatch.setattr(asr, "_select_backend", lambda *a, **k: backend)
+
+    asr.transcribe_audio("a.wav", model_id="some-org/custom-asr", device="cpu")
+
+    assert seen == [("some-org/custom-asr", "cpu")]
+
+
 # --- darwin resolution unchanged (device ignored, MLX untouched) -----------
 
 def test_mlx_load_ignores_device(monkeypatch) -> None:
