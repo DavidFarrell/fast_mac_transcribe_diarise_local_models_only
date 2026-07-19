@@ -7,11 +7,26 @@ nothing merges to `main` this run (see GPU gate).
 
 ## Slice 0 - environment probe + decision gate (documentation-only commit)
 
+AMENDMENTS from execution (recorded here so later slices read one truth):
+- Mac deps (parakeet-mlx, coremltools) INSTALL cleanly on Linux and fail at
+  IMPORT/runtime - Slice 2's isolation is import-guarding, and Slice 1's
+  markers are still wanted (no point installing dead weight) but are not the
+  correctness mechanism.
+- The Mac reference stdout contains non-JSON human-print lines. The frozen
+  contract is the event/turn SCHEMA, not stdout purity. Pure-JSONL stdout on
+  Linux is an improvement we add; Slice 4's reference comparison must
+  tolerate the Mac's non-JSON lines (filter to JSON-parseable lines first).
+- Senko's CPU path uses silero VAD (no HF gate); the pyannote/segmentation-3.0
+  gate applies only to its CUDA path - folded into the GPU-gate pending job
+  (token step for David at reboot time).
+
 The only repo change this slice makes is committing its ground-truth note to
 `design/slice0-ground-truth.md`. Contents required:
 
-- uv venv probe on Linux: which current deps fail to install (parakeet-mlx,
-  coremltools expected) - recorded with exact errors.
+- uv venv probe on Linux: for each current dep, explicit install probe, then
+  import probe, then minimal-runtime probe - recording the exact failure at
+  the stage where it occurs (parakeet-mlx and coremltools INSTALL fine on
+  Linux and fail at import/runtime; see amendments above).
 - Senko probe: install, import, model load AND a real CPU inference on a
   short sample. **STOP if ANY of those fails on CPU** - CPU operation is
   mandatory pre-reboot; revise this plan for a direct pyannote+CAM++ fallback
@@ -44,6 +59,54 @@ The only repo change this slice makes is committing its ground-truth note to
 supplied only via the Hugging Face credential store or an environment
 variable - never CLI args, repo files, test fixtures, design notes, or
 captured logs. Never enable remote code execution to load a model.
+
+## Slice 0.5 - backend reconciliation (union merge; inserted after macbase's divergence report, board #812)
+
+The reprocess two-stream layer exists only in muesli's embedded backend copy;
+this repo is the chosen canonical target (decision: board #811/#812). Merge
+the embedded copy INTO this repo on linux-cuda as a UNION, not an overwrite.
+"Union" means: compatible live behavior from BOTH trees is preserved, and
+intentional deletions (e.g. the Sortformer retirement) are honored as
+deletions - nothing retired is resurrected. First step: pin and record the
+exact source snapshots being reconciled - the muesli repo commit whose
+embedded copy is merged from, and this repo's linux-cuda commit merged onto -
+in design/slice0.5-reconciliation.md. That file must record the resolution
+(taken-from-embedded / taken-from-standalone / hand-merged, with a one-line
+why) for EVERY differing shared module (diarisation.py, senko_diarisation.py,
+cli.py, audio.py, asr.py, merge.py), not only diarisation.py:
+
+- Bring in: reprocess.py, recovery.py, constants.py, muesli_backend.py, and
+  the embedded-only fixes - READ these muesli-repo commits before merging:
+  ad57496 (mic PTS anchor - the 8 Jul data-loss RCA fix; see
+  engineer-notes/bug-2026-07-08-mic-stall), c5ed117 (retire dead Sortformer
+  backend), c36a45f (ASR recovery fault-isolation).
+- Keep: standalone-only numba_cache.py and its recent fixes - 65c7eab
+  (concurrency hardening + silent-audio), 524db9c (--warm-cache), 10bdd8f
+  (UTF-8 ffmpeg stderr).
+- Danger zone: diarisation.py differs by 741 lines (senko_diarisation.py 218,
+  cli.py 114, audio.py 61, asr.py 29, merge.py 5). The reconciled
+  diarisation.py gets its OWN dedicated GPT-5 review round in this slice's
+  loop, separate from the slice-level review.
+- Both entry-point contracts are preserved and smoke-tested (as far as CPU +
+  current deps allow): `diarise-transcribe --in/--out` AND
+  `python -m diarise_transcribe.reprocess <folder> --stream both` JSONL.
+- Everything stays on linux-cuda. The Mac's live call paths (muesli-merge ->
+  embedded copy, fast-transcribe/blogify -> standalone) stay pointed where
+  they are until David chooses to re-point them; nothing in this run edits
+  the muesli repo.
+- macbase gate, ordered BEFORE this slice merges: macbase runs the Mac
+  reference command (and deterministic tests) from this slice's candidate
+  branch - the reconciliation is the change most able to break the Mac path,
+  so it does not merge into linux-cuda until the Mac run is green.
+
+Exit: reconciled tree on linux-cuda; existing deterministic tests still
+green PLUS new focused deterministic regressions for the mic PTS anchor and
+ASR recovery fault-isolation behaviors; a model-stubbed two-stream
+`reprocess --stream both` run validating the JSONL event/turn contract
+without loading real models; proof retired Sortformer code is not selectable
+or imported; both CLIs importable and showing --help on Linux
+(real-model paths may still fail pending Slices 1-3); reconciliation
+decisions recorded in design/slice0.5-reconciliation.md.
 
 ## Slice 1 - packaging split
 
