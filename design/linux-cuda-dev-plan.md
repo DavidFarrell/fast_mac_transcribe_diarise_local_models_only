@@ -230,16 +230,36 @@ Tooling decisions (made now, not by the builder): yt-dlp = managed tool via
 package, verified with `ffmpeg -version` (if absent, that is a David sudo
 step routed via the board).
 
-## Slice 5b - wrapper edits (per the 5a list)
+## Slice 5b - wrapper edits (per the 5a audit + boss rulings, 19 Jul)
 
-Edits happen only in TRACKED canonical sources. 5a must establish where each
-skill's canonical source lives (this repo's `skill/` dir is expected to be
-canonical for fast-transcribe; if an installed `~/.claude/skills/` file has
-no tracked source, STOP for direction rather than making unreviewable
-home-directory edits). 5b edits the tracked source, and the install step
-(copy into `~/.claude/skills/`) is recorded as a command in design/. Live
-YouTube blogify run = recorded manual smoke test (commands + output in
-design/), NOT a pytest dependency.
+5a audit complete (design/slice5a-wrapper-audit.md). Boss rulings:
+1. Canonical for the fast-transcribe skill = THIS repo's root `skill.md`
+   (NOT `skill/` - that dir is an orphaned "fast-diarize" skill; 5b marks it
+   deprecated in-place; actual deletion is recorded as a recommendation for
+   David, not executed this run). The installed copy has drifted AHEAD
+   (NUMBA_CACHE_DIR, multi-transcription + permissions blocks) - 5b
+   reconciles that drift INTO skill.md first, then edits for Linux, then
+   installs (cp recorded in design/).
+2. blogify + podcast-transcribe DO have a tracked home:
+   ~/git/projects/david_claude_skills (clone of DavidFarrell/
+   david_claude_skills - found after the audit; contains both). 5b flow per
+   skill: diff installed vs repo copy, reconcile drift into the repo, make
+   the Linux edits there, install, push the repo. Note for the builder: the
+   PodSync/Pocket Casts paths reference Mac-resident services - the Linux
+   edit marks those sections platform-conditional (Mac-only), it does not
+   pretend they work here.
+3. muesli-merge is intentionally Mac-only this run (Muesli recordings exist
+   only on the Mac) - excluded from 5b; the Electron phase-2 project brings
+   its Linux equivalent.
+4. mogrify/ImageMagick absent: batched into the reboot-time David-sudo list
+   (with the reboot itself); blogify error-path only, low priority.
+5. david_claude_skills also contains a fast-transcribe copy - after 5b's
+   reconcile, sync it from this repo's skill.md so the two tracked copies
+   agree (one-way: pipeline repo is authoritative for this skill).
+
+Live YouTube blogify run = recorded manual smoke test (commands + output in
+design/), NOT a pytest dependency. yt-dlp 2026.7.4 installed (uv tool);
+ffmpeg 6.1.1 present.
 
 ## GPU gate (blocked on David's reboot - registered as vault pending-job)
 
