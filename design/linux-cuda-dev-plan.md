@@ -201,6 +201,14 @@ slice merges. (Per-stream isolation is Slice 4's concern.)
 
 ## Slice 4 - end-to-end contract verification
 
+SCOPE ADDITION (from slice 3's flag, 19 Jul): the CLI constructs
+SenkoDiarizer without a device argument, so the CLI device option currently
+reaches ASR but NOT diarisation. Slice 4 wires the existing device value
+through to diarizer construction (no new flags - the frozen option routes to
+both engines per the plan's semantics) plus a deterministic test proving the
+CLI-supplied device reaches the diarizer. Without this the GPU gate cannot
+prove CUDA diarisation end-to-end.
+
 Golden test, defined precisely:
 - Runs the real entry point as a subprocess with existing flags on the
   two-stream fixture from macbase.
