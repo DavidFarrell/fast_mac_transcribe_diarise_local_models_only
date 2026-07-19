@@ -15,13 +15,21 @@ authors = [
 keywords = ["transcription", "diarisation", "asr", "mlx", "coreml", "apple-silicon"]
 
 dependencies = [
-    "parakeet-mlx>=0.2.0",
+    # Shared (platform-neutral)
     "numpy>=1.26.0",
     "soundfile>=0.12.0",
     "librosa>=0.10.0",
     "huggingface-hub>=0.20.0",
-    "coremltools>=7.0",
-    "senko @ git+https://github.com/narcotic-sh/senko.git",
+    "senko @ git+https://github.com/narcotic-sh/senko.git@f1bc30c2ff37d807eec91bec5246eea3fe2dcbe3",
+    # Mac (Apple Silicon MLX + CoreML route)
+    "parakeet-mlx>=0.2.0 ; sys_platform == 'darwin'",
+    "coremltools>=7.0 ; sys_platform == 'darwin'",
+    # Linux (CUDA/NeMo route). torch/torchaudio come from the cu128 index
+    # (see [tool.uv.sources]); torchaudio must be pinned to the same build as
+    # torch or silero-vad floats it to a CUDA-13 wheel that fails to load.
+    "torch==2.8.0 ; sys_platform == 'linux'",
+    "torchaudio==2.8.0 ; sys_platform == 'linux'",
+    "nemo-toolkit[asr]==2.7.3 ; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +44,24 @@ diarise-transcribe = "diarise_transcribe.cli:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+# Linux torch/torchaudio are pulled from PyTorch's cu128 index (the CUDA 12.8
+# build verified in design/slice0-ground-truth.md). `explicit = true` keeps this
+# index off every other package.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[tool.pytest.ini_options]
+addopts = "-m \"not integration\""
+markers = [
+    "integration: needs real models or GPU; excluded from the default run",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/diarise_transcribe"]

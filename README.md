@@ -167,6 +167,20 @@ Models are downloaded from HuggingFace on first use. Ensure you have internet ac
 ### CoreML errors
 Ensure you're on macOS with Apple Silicon. Intel Macs are not supported.
 
+## Development
+
+The test surface lives behind the `dev` extra (pytest, black, ruff). A plain
+`uv sync` installs only the runtime dependencies; install the extra to run the
+tests:
+
+```bash
+uv sync --extra dev
+uv run --extra dev pytest -m "not integration"
+```
+
+The default run excludes tests marked `integration` (they need real models or a
+GPU).
+
 ## License
 
 MIT

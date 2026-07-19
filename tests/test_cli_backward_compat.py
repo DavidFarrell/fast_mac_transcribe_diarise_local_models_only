@@ -69,6 +69,10 @@ def test_no_canonical_cache_present_startup_is_cold_and_silent(tmp_path, monkeyp
     canonical_root = tmp_path / "does-not-exist"
     senko_cache_dir = tmp_path / "senko-cache-does-not-exist"
     env = dict(__import__("os").environ)
+    # A NUMBA_CACHE_DIR inherited from the caller's environment would suppress
+    # cli.py's per-PID default (it only sets the var when unset), so scrub it to
+    # keep this test hermetic regardless of how the test runner was invoked.
+    env.pop("NUMBA_CACHE_DIR", None)
     env["FAST_DIARISE_NUMBA_CANONICAL_ROOT"] = str(canonical_root)
     env["FAST_DIARISE_SENKO_CACHE_DIR_OVERRIDE"] = str(senko_cache_dir)
 
