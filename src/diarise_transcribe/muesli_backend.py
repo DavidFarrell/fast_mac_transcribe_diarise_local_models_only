@@ -1,0 +1,986 @@
+"""
+Backend adapter for Muesli framed audio protocol -> diarise/transcribe pipeline.
+
+Reads framed messages on stdin and writes JSONL events to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import queue
+import struct
+import sys
+import tempfile
+import threading
+import time
+import wave
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, List, Optional
+
+from .audio import check_ffmpeg, normalise_audio, is_wav_16k_mono
+from .asr import ASRModel, DEFAULT_MODEL
+from .constants import DEFAULT_GAP_THRESHOLD_SECONDS, DEFAULT_SPEAKER_TOLERANCE_SECONDS
+from .diarisation import DiarSegment
+from .merge import merge_transcript_with_diarisation
+
+MSG_AUDIO = 1
+MSG_SCREENSHOT_EVENT = 2
+MSG_MEETING_START = 3
+MSG_MEETING_STOP = 4
+
+STREAM_SYSTEM = 0
+STREAM_MIC = 1
+
+HDR_STRUCT = struct.Struct("<BBqI")  # type, stream, pts_us, payload_len
+BYTES_PER_SAMPLE = 2  # int16
+RUN_PIPELINE_LOCK = threading.Lock()
+CONTEXT_SECONDS = 30.0
+
+# Live-asr-only mode skips diarisation and labels turns by stream instead.
+STREAM_DISPLAY_LABELS = {"mic": "Microphone", "system": "System"}
+
+
+@dataclass
+class StreamWriter:
+    path: Path
+    wav: wave.Wave_write
+    pcm: BinaryIO
+    last_sample_index: int = 0
+    bytes_written: int = 0
+    # Cumulative counters for write_aligned_audio's PTS-alignment drops - see
+    # _log_and_count_drop. Before the 2026-07-08 mic-stall fix these drops
+    # were entirely silent (no log, no counter), which is why that incident's
+    # ~60s of lost mic audio could only be proven after the fact by
+    # inference (engineer-notes/bug-2026-07-08-mic-stall/RCA-2026-07-08.md).
+    # frames_dropped counts DROP EVENTS (one per write_aligned_audio call
+    # that dropped or front-trimmed a frame), not individual PCM sample
+    # frames - bytes_dropped is the actual data-loss measure.
+    frames_dropped: int = 0
+    bytes_dropped: int = 0
+    last_drop_log_time: Optional[float] = None
+
+
+@dataclass
+class StreamSnapshot:
+    pcm_path: Path
+    sample_rate: int
+    channels: int
+    size_bytes: int
+
+
+def read_exact(f: BinaryIO, n: int) -> bytes:
+    data = f.read(n)
+    if len(data) != n:
+        raise EOFError
+    return data
+
+
+class StdoutWriter:
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue[Optional[str]] = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name="stdout-writer", daemon=True)
+        self._thread.start()
+
+    def write(self, line: str) -> None:
+        self._queue.put(line)
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            line = self._queue.get()
+            if line is None:
+                break
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
+def emit_jsonl(obj: dict, writer: Optional["StdoutWriter"] = None) -> None:
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    try:
+        if writer:
+            writer.write(line)
+        else:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    except Exception:
+        return
+
+
+def log(msg: str, verbose: bool) -> None:
+    if verbose:
+        try:
+            print(msg, file=sys.stderr)
+        except Exception:
+            return
+
+
+def open_stream_writer(path: Path, sample_rate: int, channels: int) -> StreamWriter:
+    wav = wave.open(str(path), "wb")
+    wav.setnchannels(channels)
+    wav.setsampwidth(BYTES_PER_SAMPLE)
+    wav.setframerate(sample_rate)
+    pcm_path = path.with_suffix(".pcm")
+    try:
+        pcm = open(pcm_path, "wb")
+    except Exception:
+        wav.close()
+        raise
+    return StreamWriter(path=path, wav=wav, pcm=pcm)
+
+
+def close_stream_writer(writer: StreamWriter) -> None:
+    try:
+        writer.wav.close()
+    finally:
+        writer.pcm.close()
+
+
+def rms_int16(pcm: bytes) -> float:
+    if len(pcm) < 2:
+        return 0.0
+    count = len(pcm) // 2
+    ints = struct.unpack("<" + "h" * count, pcm)
+    acc = 0.0
+    for v in ints:
+        x = v / 32768.0
+        acc += x * x
+    return (acc / count) ** 0.5
+
+
+DROP_LOG_MIN_INTERVAL_SECONDS = 5.0
+
+
+def _log_and_count_drop(
+    writer: StreamWriter,
+    stream_name: str,
+    *,
+    pts_us: int,
+    start_sample: int,
+    dropped_bytes: int,
+) -> None:
+    """Records a write_aligned_audio drop/trim: always bumps the writer's
+    cumulative counters, and prints a line to stderr - unconditionally on
+    the first occurrence, then rate-limited to at most one line per writer
+    per DROP_LOG_MIN_INTERVAL_SECONDS after that, so a sustained epoch-reset
+    stall (the 2026-07-08 mic-stall shape) doesn't spam a line per frame.
+    Deliberately NOT gated behind `log()`/--verbose - backend.log's stderr
+    lines surface directly in the app's live log, and a drop that corrupts
+    the recording must always be visible there, verbose or not.
+    """
+    writer.frames_dropped += 1
+    writer.bytes_dropped += dropped_bytes
+
+    now = time.monotonic()
+    first_occurrence = writer.last_drop_log_time is None
+    if not first_occurrence and (now - writer.last_drop_log_time) < DROP_LOG_MIN_INTERVAL_SECONDS:
+        return
+    writer.last_drop_log_time = now
+
+    try:
+        print(
+            f"[muesli-backend] AUDIO DROP stream={stream_name} pts_us={pts_us} "
+            f"start_sample={start_sample} last_sample_index={writer.last_sample_index} "
+            f"dropped_bytes={dropped_bytes} "
+            f"cumulative_frames_dropped={writer.frames_dropped} "
+            f"cumulative_bytes_dropped={writer.bytes_dropped}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def write_aligned_audio(
+    writer: StreamWriter,
+    payload: bytes,
+    pts_us: int,
+    sample_rate: int,
+    channels: int,
+    stream_name: str = "unknown",
+) -> None:
+    if not payload:
+        return
+
+    bytes_per_frame = BYTES_PER_SAMPLE * channels
+    usable = (len(payload) // bytes_per_frame) * bytes_per_frame
+    if usable <= 0:
+        return
+    payload = payload[:usable]
+
+    # PTS is in microseconds since meeting start; align to sample index.
+    start_sample = int(round(pts_us * sample_rate / 1_000_000.0))
+    if start_sample < 0:
+        start_sample = 0
+
+    if start_sample > writer.last_sample_index:
+        gap_frames = start_sample - writer.last_sample_index
+        silence = b"\x00" * (gap_frames * bytes_per_frame)
+        writer.wav.writeframes(silence)
+        writer.pcm.write(silence)
+        writer.last_sample_index += gap_frames
+        writer.bytes_written += len(silence)
+    elif start_sample < writer.last_sample_index:
+        overlap_frames = writer.last_sample_index - start_sample
+        drop_bytes = overlap_frames * bytes_per_frame
+        if drop_bytes >= len(payload):
+            # Whole payload lands behind the write position - previously
+            # dropped with no trace at all (see _log_and_count_drop).
+            _log_and_count_drop(
+                writer, stream_name,
+                pts_us=pts_us, start_sample=start_sample, dropped_bytes=len(payload),
+            )
+            return
+        _log_and_count_drop(
+            writer, stream_name,
+            pts_us=pts_us, start_sample=start_sample, dropped_bytes=drop_bytes,
+        )
+        payload = payload[drop_bytes:]
+
+    writer.wav.writeframes(payload)
+    writer.pcm.write(payload)
+    writer.pcm.flush()
+    writer.last_sample_index += len(payload) // bytes_per_frame
+    writer.bytes_written += len(payload)
+
+
+def snapshot_stream(writer: StreamWriter, sample_rate: int, channels: int) -> StreamSnapshot:
+    pcm_path = writer.path.with_suffix(".pcm")
+    size = pcm_path.stat().st_size if pcm_path.exists() else 0
+    return StreamSnapshot(
+        pcm_path=pcm_path,
+        sample_rate=sample_rate,
+        channels=channels,
+        size_bytes=size,
+    )
+
+
+def write_wav_chunk(
+    snapshot: StreamSnapshot,
+    temp_dir: Path,
+    start_byte: int = 0,
+) -> Optional[Path]:
+    if snapshot.size_bytes <= start_byte:
+        return None
+
+    bytes_per_frame = BYTES_PER_SAMPLE * snapshot.channels
+    start_byte = (start_byte // bytes_per_frame) * bytes_per_frame
+
+    remaining = snapshot.size_bytes - start_byte
+    remaining -= (remaining % bytes_per_frame)
+    if remaining <= 0:
+        return None
+
+    temp = tempfile.NamedTemporaryFile(suffix=".wav", prefix="muesli_live_", dir=temp_dir, delete=False)
+    temp_path = Path(temp.name)
+    temp.close()
+
+    with wave.open(str(temp_path), "wb") as wav_out:
+        wav_out.setnchannels(snapshot.channels)
+        wav_out.setsampwidth(BYTES_PER_SAMPLE)
+        wav_out.setframerate(snapshot.sample_rate)
+
+        with open(snapshot.pcm_path, "rb") as pcm:
+            pcm.seek(start_byte)
+            while remaining > 0:
+                chunk = pcm.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                wav_out.writeframes(chunk)
+                remaining -= len(chunk)
+
+    return temp_path
+
+
+def write_wav_from_pcm(snapshot: StreamSnapshot, temp_dir: Path) -> Optional[Path]:
+    return write_wav_chunk(snapshot, temp_dir, start_byte=0)
+
+
+def compute_incremental_window(
+    last_processed_byte: int,
+    bytes_per_sec: float,
+    context_seconds: float = CONTEXT_SECONDS,
+) -> tuple[int, float]:
+    """Compute (read_start_byte, timestamp_offset) for a tail pass over a
+    growing PCM stream: start `context_seconds` before the last processed
+    byte (so ASR still has boundary context), clamped to the start of the
+    stream, and return the offset needed to re-align that chunk's word
+    timestamps back into meeting time.
+    """
+    context_bytes = int(context_seconds * bytes_per_sec)
+    read_start_byte = max(0, last_processed_byte - context_bytes)
+    timestamp_offset = read_start_byte / float(bytes_per_sec)
+    return read_start_byte, timestamp_offset
+
+
+def _synthetic_stream_segments(
+    transcript: "TranscriptResult",
+    stream_label: Optional[str],
+) -> List[DiarSegment]:
+    """Build a single full-window DiarSegment spanning the transcript's word
+    range, labelled with the stream's display name. Used in live-asr-only
+    mode so the existing turn-splitting merge machinery (gap_threshold etc.)
+    can run unchanged without a diariser in the loop.
+    """
+    if not transcript.words:
+        return []
+    label = stream_label or "Speaker"
+    start = min(w.start for w in transcript.words)
+    end = max(w.end for w in transcript.words)
+    return [DiarSegment(start=start, end=end, speaker=label)]
+
+
+def run_pipeline(
+    input_path: Path,
+    diar_backend: str,
+    asr_model: str,
+    language: Optional[str],
+    gap_threshold: float,
+    speaker_tolerance: float,
+    verbose: bool,
+    timestamp_offset: float = 0.0,
+    live_asr_only: bool = False,
+    stream_label: Optional[str] = None,
+) -> "MergedTranscript":
+    temp_wav = None
+    delete_temp = False
+    if is_wav_16k_mono(str(input_path)):
+        temp_wav = str(input_path)
+    else:
+        if not check_ffmpeg():
+            raise RuntimeError("ffmpeg is not installed or not in PATH")
+        log("Normalising audio to 16kHz mono WAV...", verbose)
+        temp_wav = normalise_audio(str(input_path))
+        delete_temp = True
+
+    try:
+        log(f"Running ASR with {asr_model}...", verbose)
+        asr = ASRModel(asr_model)
+        transcript = asr.transcribe(temp_wav, language=language)
+        if timestamp_offset:
+            for word in transcript.words:
+                word.start += timestamp_offset
+                word.end += timestamp_offset
+
+        if live_asr_only:
+            log(f"Live ASR-only mode: labelling turns as {stream_label!r}, no diariser.", verbose)
+            segments = _synthetic_stream_segments(transcript, stream_label)
+        elif diar_backend == "senko":
+            log("Running diarisation with Senko...", verbose)
+            from .senko_diarisation import SenkoDiarizer
+            diarizer = SenkoDiarizer(quiet=not verbose)
+            segments = diarizer.diarise(temp_wav)
+        else:
+            raise ValueError(
+                f"Unknown diar_backend {diar_backend!r}: only 'senko' is supported "
+                "(the Sortformer backend was retired)."
+            )
+        # Diariser segments are in chunk-local time and need shifting into
+        # meeting time. Synthetic live-asr-only segments are built from the
+        # ALREADY-shifted words above - shifting them again would double the
+        # offset, lose all word overlap, and label every turn UNKNOWN.
+        if timestamp_offset and not live_asr_only:
+            for seg in segments:
+                seg.start += timestamp_offset
+                seg.end += timestamp_offset
+
+        merged = merge_transcript_with_diarisation(
+            transcript,
+            segments,
+            gap_threshold=gap_threshold,
+            speaker_tolerance=speaker_tolerance,
+        )
+        return merged
+    finally:
+        if delete_temp and temp_wav:
+            try:
+                Path(temp_wav).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+class TranscriptEmitter:
+    def __init__(self, stdout_writer: StdoutWriter, finalize_lag: float) -> None:
+        self._stdout_writer = stdout_writer
+        self._finalize_lag = finalize_lag
+        self._last_emitted_t1_by_stream = {}
+        self._last_partial_by_stream = {}
+        self._seen_speakers = set()
+        self._lock = threading.Lock()
+
+    def emit_transcript(
+        self,
+        merged: "MergedTranscript",
+        current_duration: float,
+        finalize: bool,
+        stream_name: Optional[str] = None,
+        live_asr_only: bool = False,
+    ) -> None:
+        if not merged.turns:
+            return
+
+        # Live-asr-only turns are already labelled "Microphone"/"System" by
+        # the stream, so speaker_id doesn't need the stream-name prefix that
+        # disambiguates diariser-assigned SPEAKER_NN ids across streams.
+        def speaker_id_for(speaker: str) -> str:
+            if live_asr_only or not stream_name:
+                return speaker
+            return f"{stream_name}:{speaker}"
+
+        with self._lock:
+            stream_key = stream_name or "default"
+            last_emitted_t1 = self._last_emitted_t1_by_stream.get(stream_key, 0.0)
+            last_partial = self._last_partial_by_stream.get(stream_key)
+
+            new_speakers = False
+            for turn in merged.turns:
+                speaker_id = speaker_id_for(turn.speaker)
+                if speaker_id not in self._seen_speakers:
+                    self._seen_speakers.add(speaker_id)
+                    new_speakers = True
+
+            if new_speakers:
+                known = [{"speaker_id": s, "name": s} for s in sorted(self._seen_speakers)]
+                emit_jsonl({"type": "speakers", "known": known}, self._stdout_writer)
+
+            cutoff = current_duration if finalize else max(0.0, current_duration - self._finalize_lag)
+            for turn in merged.turns:
+                if turn.end <= cutoff and turn.end > last_emitted_t1 + 0.02:
+                    speaker_id = speaker_id_for(turn.speaker)
+                    emit_jsonl({
+                        "type": "segment",
+                        "speaker": turn.speaker,
+                        "speaker_id": speaker_id,
+                        "stream": stream_name,
+                        "t0": turn.start,
+                        "t1": turn.end,
+                        "text": turn.text,
+                    }, self._stdout_writer)
+                    last_emitted_t1 = max(last_emitted_t1, turn.end)
+
+            if not finalize:
+                last_turn = merged.turns[-1]
+                if last_turn.end > cutoff:
+                    partial = (last_turn.speaker, last_turn.start, last_turn.text)
+                    if partial != last_partial:
+                        speaker_id = speaker_id_for(last_turn.speaker)
+                        emit_jsonl({
+                            "type": "partial",
+                            "speaker_id": speaker_id,
+                            "stream": stream_name,
+                            "t0": last_turn.start,
+                            "text": last_turn.text,
+                        }, self._stdout_writer)
+                        last_partial = partial
+
+            self._last_emitted_t1_by_stream[stream_key] = last_emitted_t1
+            self._last_partial_by_stream[stream_key] = last_partial
+
+
+class LiveProcessor:
+    def __init__(
+        self,
+        stream_name: str,
+        state: "BackendState",
+        emitter: TranscriptEmitter,
+        output_dir: Path,
+        diar_backend: str,
+        asr_model: str,
+        language: Optional[str],
+        gap_threshold: float,
+        speaker_tolerance: float,
+        live_interval: float,
+        live_min_seconds: float,
+        verbose: bool,
+        live_asr_only: bool = False,
+    ) -> None:
+        self._stream_name = stream_name
+        self._state = state
+        self._emitter = emitter
+        self._output_dir = output_dir
+        self._diar_backend = diar_backend
+        self._asr_model = asr_model
+        self._language = language
+        self._gap_threshold = gap_threshold
+        self._speaker_tolerance = speaker_tolerance
+        self._live_interval = live_interval
+        self._live_min_seconds = live_min_seconds
+        self._verbose = verbose
+        self._live_asr_only = live_asr_only
+        self._display_label = STREAM_DISPLAY_LABELS.get(stream_name, stream_name)
+
+        self._current_duration = 0.0
+        self._last_processed_duration = 0.0
+        self._last_processed_byte = 0
+        self._event = threading.Event()
+        self._stop_event = threading.Event()
+        self._finalize_requested = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def notify_duration(self, duration: float) -> None:
+        self._current_duration = duration
+        if duration >= self._live_min_seconds and (duration - self._last_processed_duration) >= self._live_interval:
+            self._event.set()
+
+    def stop(self, finalize: bool) -> None:
+        self._finalize_requested = finalize
+        self._stop_event.set()
+        self._event.set()
+        self._thread.join()
+
+    def _snapshot(self) -> Optional[StreamSnapshot]:
+        with self._state.lock:
+            writer = self._state.get_stream(self._stream_name)
+            if self._stream_name == "system":
+                sample_rate = self._state.system_sample_rate
+                channels = self._state.system_channels
+            else:
+                sample_rate = self._state.mic_sample_rate
+                channels = self._state.mic_channels
+        if not writer:
+            return None
+        return snapshot_stream(writer, sample_rate, channels)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._event.wait(timeout=0.5)
+            self._event.clear()
+            if self._maybe_process(finalize=False):
+                continue
+        if self._finalize_requested:
+            self._maybe_process(finalize=True)
+
+    def _maybe_process(self, finalize: bool) -> bool:
+        snapshot = self._snapshot()
+        if not snapshot or snapshot.size_bytes <= 0:
+            return False
+
+        bytes_per_sec = snapshot.sample_rate * snapshot.channels * BYTES_PER_SAMPLE
+        if bytes_per_sec <= 0:
+            return False
+        duration = snapshot.size_bytes / float(bytes_per_sec)
+
+        # Default mode's finalize pass is a full byte-0 reprocess (unchanged -
+        # reprocess.py is authoritative there anyway). Live-asr-only mode's
+        # finalize is instead a fast incremental tail pass so "stop" returns
+        # quickly: it reads from the same rolling window as a live pass, but
+        # skips the min-duration/min-interval gates so the last few seconds
+        # of speech still make it into the live transcript.
+        fast_finalize = finalize and self._live_asr_only
+
+        if not finalize or fast_finalize:
+            if not finalize:
+                new_bytes = snapshot.size_bytes - self._last_processed_byte
+                if duration < self._live_min_seconds:
+                    return False
+                if (new_bytes / float(bytes_per_sec)) < self._live_interval:
+                    return False
+            # Fast finalize runs even with ZERO new bytes: the previous live
+            # pass held back the last `finalize_lag` seconds as a partial, so
+            # the tail window must be reprocessed with finalize semantics to
+            # promote that held-back speech to final segments. The emitter's
+            # last_emitted_t1 dedupe suppresses re-emission of earlier turns.
+            read_start_byte, timestamp_offset = compute_incremental_window(
+                self._last_processed_byte, bytes_per_sec
+            )
+        else:
+            read_start_byte = 0
+            timestamp_offset = 0.0
+
+        emit_jsonl({
+            "type": "status",
+            "message": "live_process_start",
+            "stream": self._stream_name,
+            "duration": duration,
+            "finalize": finalize,
+        }, self._state.stdout_writer)
+
+        temp_wav = write_wav_chunk(snapshot, self._output_dir, start_byte=read_start_byte)
+        if not temp_wav:
+            return False
+
+        try:
+            with RUN_PIPELINE_LOCK:
+                merged = run_pipeline(
+                    input_path=temp_wav,
+                    diar_backend=self._diar_backend,
+                    asr_model=self._asr_model,
+                    language=self._language,
+                    gap_threshold=self._gap_threshold,
+                    speaker_tolerance=self._speaker_tolerance,
+                    timestamp_offset=timestamp_offset,
+                    verbose=self._verbose,
+                    live_asr_only=self._live_asr_only,
+                    stream_label=self._display_label,
+                )
+        except Exception as exc:
+            emit_jsonl({"type": "error", "message": str(exc)}, self._state.stdout_writer)
+            return False
+        finally:
+            temp_wav.unlink(missing_ok=True)
+
+        emit_jsonl({
+            "type": "status",
+            "message": "live_process_done",
+            "stream": self._stream_name,
+            "duration": duration,
+            "turns": len(merged.turns),
+            "finalize": finalize,
+        }, self._state.stdout_writer)
+
+        self._emitter.emit_transcript(
+            merged,
+            duration,
+            finalize=finalize,
+            stream_name=self._stream_name,
+            live_asr_only=self._live_asr_only,
+        )
+        self._last_processed_duration = max(self._last_processed_duration, duration)
+        self._last_processed_byte = max(self._last_processed_byte, snapshot.size_bytes)
+        return True
+
+
+class BackendState:
+    def __init__(self, stdout_writer: StdoutWriter) -> None:
+        self.lock = threading.Lock()
+        self.stdout_writer = stdout_writer
+        self.system_writer: Optional[StreamWriter] = None
+        self.mic_writer: Optional[StreamWriter] = None
+        self.sample_rate: int = 48000
+        self.channels: int = 1
+        self.system_sample_rate: int = 48000
+        self.system_channels: int = 1
+        self.mic_sample_rate: int = 48000
+        self.mic_channels: int = 1
+
+    def get_stream(self, name: str) -> Optional[StreamWriter]:
+        if name == "system":
+            return self.system_writer
+        if name == "mic":
+            return self.mic_writer
+        return None
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Muesli backend adapter for diarise-transcribe.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory to write capture artifacts (default: current directory)",
+    )
+    parser.add_argument(
+        "--transcribe-stream",
+        choices=["system", "mic", "both"],
+        default="system",
+        help="Which stream to transcribe (system, mic, both; default: system)",
+    )
+    parser.add_argument(
+        "--diar-backend",
+        choices=["senko"],
+        default="senko",
+        help="Diarisation backend (default: senko; the Sortformer backend was retired)",
+    )
+    parser.add_argument(
+        "--asr-model",
+        default=DEFAULT_MODEL,
+        help=f"ASR model ID (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="Language code for ASR (auto-detected if not specified)",
+    )
+    parser.add_argument(
+        "--gap-threshold",
+        type=float,
+        default=DEFAULT_GAP_THRESHOLD_SECONDS,
+        help=f"Gap threshold seconds for speaker turns (default: {DEFAULT_GAP_THRESHOLD_SECONDS})",
+    )
+    parser.add_argument(
+        "--speaker-tolerance",
+        type=float,
+        default=DEFAULT_SPEAKER_TOLERANCE_SECONDS,
+        help=f"Tolerance seconds for word-speaker assignment (default: {DEFAULT_SPEAKER_TOLERANCE_SECONDS})",
+    )
+    parser.add_argument(
+        "--live-interval",
+        type=float,
+        default=15.0,
+        help="Seconds between live transcript updates (default: 15)",
+    )
+    parser.add_argument(
+        "--live-min-seconds",
+        type=float,
+        default=10.0,
+        help="Minimum audio seconds before first live update (default: 10)",
+    )
+    parser.add_argument(
+        "--finalize-lag",
+        type=float,
+        default=5.0,
+        help="Seconds to hold back final segments (default: 5)",
+    )
+    parser.add_argument(
+        "--emit-meters",
+        action="store_true",
+        help="Emit RMS meter events for incoming audio",
+    )
+    parser.add_argument(
+        "--keep-wav",
+        action="store_true",
+        help="Keep captured WAV files after processing",
+    )
+    parser.add_argument(
+        "--keep-pcm",
+        action="store_true",
+        help="Keep captured PCM files after processing",
+    )
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Disable live transcript updates (process only on stop)",
+    )
+    parser.add_argument(
+        "--live-asr-only",
+        action="store_true",
+        help=(
+            "Skip the diariser for live turns and label them by stream "
+            "(Microphone/System) instead. Also switches the stop-time "
+            "finalize pass to a fast incremental tail pass. Authoritative "
+            "diarisation still runs later via reprocess.py."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Verbose logs to stderr",
+    )
+    return parser
+
+
+def main() -> int:
+    args = create_parser().parse_args()
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stdout_writer = StdoutWriter()
+    state = BackendState(stdout_writer)
+    emitter = TranscriptEmitter(stdout_writer, finalize_lag=args.finalize_lag)
+
+    transcribe_streams = ["system", "mic"] if args.transcribe_stream == "both" else [args.transcribe_stream]
+    live_processors = {}
+
+    if not args.no_live:
+        for stream_name in transcribe_streams:
+            live_processor = LiveProcessor(
+                stream_name=stream_name,
+                state=state,
+                emitter=emitter,
+                output_dir=output_dir,
+                diar_backend=args.diar_backend,
+                asr_model=args.asr_model,
+                language=args.language,
+                gap_threshold=args.gap_threshold,
+                speaker_tolerance=args.speaker_tolerance,
+                live_interval=args.live_interval,
+                live_min_seconds=args.live_min_seconds,
+                verbose=args.verbose,
+                live_asr_only=args.live_asr_only,
+            )
+            live_processor.start()
+            live_processors[stream_name] = live_processor
+
+    stdin = sys.stdin.buffer
+
+    while True:
+        try:
+            hdr = read_exact(stdin, HDR_STRUCT.size)
+        except EOFError:
+            break
+
+        msg_type, stream_id, pts_us, payload_len = HDR_STRUCT.unpack(hdr)
+        payload = read_exact(stdin, payload_len) if payload_len else b""
+
+        if msg_type == MSG_MEETING_START:
+            meeting_meta = json.loads(payload.decode("utf-8")) if payload else {}
+            with state.lock:
+                state.sample_rate = int(meeting_meta.get("sample_rate", 48000))
+                state.channels = int(meeting_meta.get("channels", 1))
+
+                state.system_sample_rate = int(
+                    meeting_meta.get("system_sample_rate", meeting_meta.get("sample_rate", state.sample_rate))
+                )
+                state.system_channels = int(
+                    meeting_meta.get("system_channels", meeting_meta.get("channels", state.channels))
+                )
+                state.mic_sample_rate = int(
+                    meeting_meta.get("mic_sample_rate", meeting_meta.get("sample_rate", state.sample_rate))
+                )
+                state.mic_channels = int(
+                    meeting_meta.get("mic_channels", meeting_meta.get("channels", state.channels))
+                )
+
+                state.system_writer = open_stream_writer(
+                    output_dir / "system.wav",
+                    state.system_sample_rate,
+                    state.system_channels
+                )
+                state.mic_writer = open_stream_writer(
+                    output_dir / "mic.wav",
+                    state.mic_sample_rate,
+                    state.mic_channels
+                )
+
+            emit_jsonl({"type": "status", "message": "meeting_started", "meta": meeting_meta}, stdout_writer)
+
+        elif msg_type == MSG_AUDIO:
+            t = pts_us / 1_000_000.0
+            with state.lock:
+                if stream_id == STREAM_SYSTEM and state.system_writer:
+                    write_aligned_audio(
+                        state.system_writer,
+                        payload,
+                        pts_us,
+                        state.system_sample_rate,
+                        state.system_channels,
+                        stream_name="system"
+                    )
+                    if args.emit_meters:
+                        emit_jsonl({"type": "meter", "stream": "system", "t": t, "rms": rms_int16(payload)}, stdout_writer)
+                    if not args.no_live and "system" in live_processors:
+                        duration = state.system_writer.last_sample_index / float(state.system_sample_rate)
+                        live_processors["system"].notify_duration(duration)
+                elif stream_id == STREAM_MIC and state.mic_writer:
+                    write_aligned_audio(
+                        state.mic_writer,
+                        payload,
+                        pts_us,
+                        state.mic_sample_rate,
+                        state.mic_channels,
+                        stream_name="mic"
+                    )
+                    if args.emit_meters:
+                        emit_jsonl({"type": "meter", "stream": "mic", "t": t, "rms": rms_int16(payload)}, stdout_writer)
+                    if not args.no_live and "mic" in live_processors:
+                        duration = state.mic_writer.last_sample_index / float(state.mic_sample_rate)
+                        live_processors["mic"].notify_duration(duration)
+
+        elif msg_type == MSG_SCREENSHOT_EVENT:
+            if payload:
+                evt = json.loads(payload.decode("utf-8"))
+                emit_jsonl({"type": "screenshot", **evt}, stdout_writer)
+
+        elif msg_type == MSG_MEETING_STOP:
+            emit_jsonl({"type": "status", "message": "meeting_stopped"}, stdout_writer)
+            break
+
+    if not args.no_live:
+        for live_processor in live_processors.values():
+            live_processor.stop(finalize=True)
+
+    with state.lock:
+        system_writer = state.system_writer
+        mic_writer = state.mic_writer
+
+    if system_writer:
+        close_stream_writer(system_writer)
+    if mic_writer:
+        close_stream_writer(mic_writer)
+
+    writers = {"system": system_writer, "mic": mic_writer}
+    had_audio = False
+    for stream_name in transcribe_streams:
+        writer = writers.get(stream_name)
+        if not writer or writer.bytes_written == 0:
+            emit_jsonl({
+                "type": "error",
+                "message": f"no_audio_for_stream_{stream_name}",
+            }, stdout_writer)
+            continue
+        had_audio = True
+
+    if not had_audio:
+        return 1
+
+    if args.no_live:
+        for stream_name in transcribe_streams:
+            writer = writers.get(stream_name)
+            if not writer or writer.bytes_written == 0:
+                continue
+            if stream_name == "system":
+                sample_rate = state.system_sample_rate
+                channels = state.system_channels
+            else:
+                sample_rate = state.mic_sample_rate
+                channels = state.mic_channels
+            snapshot = snapshot_stream(writer, sample_rate, channels)
+            temp_wav = write_wav_from_pcm(snapshot, output_dir)
+            if not temp_wav:
+                emit_jsonl({"type": "error", "message": "failed_to_build_wav"}, stdout_writer)
+                continue
+
+            try:
+                with RUN_PIPELINE_LOCK:
+                    merged = run_pipeline(
+                        input_path=temp_wav,
+                        diar_backend=args.diar_backend,
+                        asr_model=args.asr_model,
+                        language=args.language,
+                        gap_threshold=args.gap_threshold,
+                        speaker_tolerance=args.speaker_tolerance,
+                        timestamp_offset=0.0,
+                        verbose=args.verbose,
+                        live_asr_only=args.live_asr_only,
+                        stream_label=STREAM_DISPLAY_LABELS.get(stream_name, stream_name),
+                    )
+            except Exception as exc:
+                emit_jsonl({"type": "error", "message": str(exc)}, stdout_writer)
+                continue
+            finally:
+                temp_wav.unlink(missing_ok=True)
+
+            if stream_name == "system":
+                sample_rate = state.system_sample_rate
+                channels = state.system_channels
+            else:
+                sample_rate = state.mic_sample_rate
+                channels = state.mic_channels
+
+            duration = writer.last_sample_index / float(sample_rate)
+            emitter.emit_transcript(
+                merged,
+                duration,
+                finalize=True,
+                stream_name=stream_name,
+                live_asr_only=args.live_asr_only,
+            )
+
+    if not args.keep_wav:
+        if system_writer:
+            system_writer.path.unlink(missing_ok=True)
+        if mic_writer:
+            mic_writer.path.unlink(missing_ok=True)
+
+    if not args.keep_pcm:
+        if system_writer:
+            system_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
+        if mic_writer:
+            mic_writer.path.with_suffix(".pcm").unlink(missing_ok=True)
+
+    stdout_writer.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
