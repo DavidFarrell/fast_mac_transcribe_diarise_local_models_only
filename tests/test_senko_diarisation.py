@@ -23,10 +23,13 @@ so any read failure degrades to "cache miss" (recompile that function)
 instead of crashing.
 """
 
+import types
 from unittest import mock
 
+import numba
 import pytest
 
+from diarise_transcribe import senko_diarisation
 from diarise_transcribe.senko_diarisation import SenkoDiarizer
 
 
@@ -112,14 +115,17 @@ class TestSenkoDiarizerNoneResult:
         except TypeError as e:
             pytest.fail(f"diarise() raised TypeError on None result: {e}")
 
-    def test_diarise_prints_no_speech_message_when_not_quiet(self, capsys):
+    def test_diarise_prints_no_speakers_message_when_not_quiet(self, capsys):
         diarizer = SenkoDiarizer(quiet=False)
         diarizer._diarizer = _FakeSenkoDiarizerNone()
 
         diarizer.diarise("fake_silent.wav")
 
+        # The merged diarise() (embedded base) reports a None/empty result
+        # as "No speakers detected in the audio." for both the no-speech and
+        # empty-merged_segments cases.
         captured = capsys.readouterr()
-        assert "no speech" in captured.out.lower()
+        assert "no speakers detected" in captured.out.lower()
 
     def test_diarise_silent_when_quiet_true(self, capsys):
         diarizer = SenkoDiarizer(quiet=True)
@@ -398,3 +404,74 @@ class TestPatchNumbaCacheIdempotent:
         assert not any(
             getattr(c, "__name__", None) == "_safe_save" for c in closure_contents
         )
+
+
+# ---------------------------------------------------------------------------
+# Embedded (muesli-backend) concurrency fix: _restore_numba_njit + the single
+# retry on a transient "underlying object has vanished" ReferenceError. This
+# is the OTHER half of the danger-zone union merge (the reconciliation keeps
+# BOTH this single-process njit-restore/retry path and the cross-process
+# _patch_numba_cache wrapper above - see design/slice0.5-reconciliation.md).
+# ---------------------------------------------------------------------------
+
+
+def test_restore_numba_njit_uses_senko_original() -> None:
+    original_njit = numba.njit
+
+    def patched_njit(*args, **kwargs):
+        return original_njit(*args, **kwargs)
+
+    fake_senko = types.SimpleNamespace(
+        config=types.SimpleNamespace(_original_njit=original_njit)
+    )
+
+    numba.njit = patched_njit
+    try:
+        senko_diarisation._restore_numba_njit(fake_senko)
+        assert numba.njit is original_njit
+    finally:
+        numba.njit = original_njit
+
+
+def test_diarise_retries_once_after_transient_reference_error(monkeypatch) -> None:
+    senko_diarisation._native_diarizer_cache.clear()
+
+    warmup_values: list[bool] = []
+    attempts = {"count": 0}
+
+    class FakeNativeDiarizer:
+        def __init__(self, *, warmup: bool):
+            self._warmup = warmup
+
+        def diarize(self, _audio_path: str, generate_colors: bool = False):
+            assert generate_colors is False
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise ReferenceError("underlying object has vanished")
+            return {
+                "merged_segments": [
+                    {"start": 0.0, "end": 1.25, "speaker": "SPEAKER_01"},
+                ],
+                "merged_speakers_detected": 1,
+            }
+
+    class FakeSenkoModule:
+        class config:
+            _original_njit = numba.njit
+
+        @staticmethod
+        def Diarizer(device: str, warmup: bool, quiet: bool):
+            assert device == "auto"
+            assert quiet is True
+            warmup_values.append(warmup)
+            return FakeNativeDiarizer(warmup=warmup)
+
+    monkeypatch.setattr(senko_diarisation, "_import_senko", lambda: FakeSenkoModule)
+
+    diarizer = senko_diarisation.SenkoDiarizer(warmup=True, quiet=True)
+    segments = diarizer.diarise("example.wav")
+
+    assert warmup_values == [True, False]
+    assert [(segment.start, segment.end, segment.speaker) for segment in segments] == [
+        (0.0, 1.25, "SPEAKER_01"),
+    ]
