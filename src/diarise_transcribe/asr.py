@@ -1,21 +1,28 @@
 """
-ASR module using parakeet-mlx on Apple Silicon.
+ASR module with per-platform backends.
 
-Provides word-level timestamps for alignment with diarisation.
+darwin: parakeet-mlx (Apple Silicon, MLX). Its loader and transcribe logic live
+in this module and are unchanged; the parakeet_mlx import is lazy so this module
+imports on linux without it.
+
+linux: NeMo loading nvidia/parakeet-tdt-0.6b-v3 (see asr_nemo.py). That module
+is imported lazily inside _select_backend so importing asr on linux pulls in
+neither mlx nor nemo/torch until a model is loaded.
+
+Backend choice is a single typed function, not a factory or registry.
 """
 
+import sys
 import threading
 from dataclasses import dataclass
-from typing import Any, List, Optional
-
-from parakeet_mlx import from_pretrained
+from typing import Any, Callable, List, NamedTuple, Optional
 
 
-# Cache of loaded parakeet-mlx models keyed by model_id, so repeated
-# ASRModel instances for the same model id reuse one in-memory model
-# instead of re-deserialising it from disk each time. Bounded by the
-# number of distinct model ids used in a process - in practice 1.
-_model_cache: dict[str, Any] = {}
+# Cache of loaded models keyed by (model_id, device), so repeated ASRModel
+# instances for the same model reuse one in-memory model instead of
+# re-deserialising it. Bounded by the number of distinct (id, device) pairs
+# used in a process - in practice 1.
+_model_cache: dict[tuple[str, str], Any] = {}
 _model_cache_lock = threading.Lock()
 
 
@@ -38,25 +45,153 @@ class TranscriptResult:
     words: List[Word]
 
 
-# Default model - Parakeet TDT 0.6B v3
-DEFAULT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# Default models - Parakeet TDT 0.6B v3, one build per platform.
+DEFAULT_MODEL_MLX = "mlx-community/parakeet-tdt-0.6b-v3"
+DEFAULT_MODEL_NEMO = "nvidia/parakeet-tdt-0.6b-v3"
+
+
+def default_model_id(platform: str = sys.platform) -> str:
+    """The default model id for the active platform's backend."""
+    return DEFAULT_MODEL_NEMO if platform.startswith("linux") else DEFAULT_MODEL_MLX
+
+
+# Resolved once at import time on the running platform, so cli.py / reprocess.py
+# get the right per-platform default without a CLI flag change.
+DEFAULT_MODEL = default_model_id()
+
+
+def check_model_id(model_id: str, platform: str = sys.platform) -> None:
+    """
+    Fail fast on a model id that belongs to the other platform's backend.
+
+    Ids prefixed for the opposite backend (mlx-community/ on linux,
+    nvidia/ on darwin) can never load and are a clear user error. Any other id
+    - custom ids, local paths, other orgs - is left for the backend to attempt.
+    """
+    if platform.startswith("linux") and model_id.startswith("mlx-community/"):
+        raise ValueError(
+            f"model id {model_id!r} is an MLX (darwin) model but this is the "
+            f"linux NeMo backend. Use an nvidia/ id such as {DEFAULT_MODEL_NEMO!r}."
+        )
+    if platform == "darwin" and model_id.startswith("nvidia/"):
+        raise ValueError(
+            f"model id {model_id!r} is a NeMo (linux) model but this is the "
+            f"darwin MLX backend. Use an mlx-community/ id such as {DEFAULT_MODEL_MLX!r}."
+        )
+
+
+class _Backend(NamedTuple):
+    """The loader and transcriber for one platform's ASR backend."""
+    load: Callable[[str, str], Any]
+    transcribe: Callable[..., TranscriptResult]
+
+
+def _select_backend(platform: str = sys.platform) -> _Backend:
+    """Return the load/transcribe pair for the active platform."""
+    if platform.startswith("linux"):
+        from . import asr_nemo
+
+        return _Backend(asr_nemo.load_model, asr_nemo.transcribe)
+    return _Backend(_load_mlx, _transcribe_mlx)
+
+
+def _load_mlx(model_id: str, device: str) -> Any:
+    """
+    Load a parakeet-mlx model (darwin). device is accepted for signature
+    parity and ignored - MLX runs on the Apple Silicon GPU/Neural Engine and
+    has no device selection, so darwin behaviour is unchanged.
+    """
+    from parakeet_mlx import from_pretrained
+
+    print(f"Loading ASR model: {model_id}")
+    model = from_pretrained(model_id)
+    print("ASR model loaded.")
+    return model
+
+
+def _transcribe_mlx(
+    model: Any,
+    audio_path: str,
+    language: Optional[str] = None,
+    chunk_duration: float = 120.0,
+    overlap_duration: float = 15.0,
+) -> TranscriptResult:
+    """Transcribe with parakeet-mlx, merging BPE subword tokens into words."""
+    result = model.transcribe(
+        audio_path,
+        chunk_duration=chunk_duration,
+        overlap_duration=overlap_duration,
+    )
+
+    # Extract words by merging BPE subword tokens
+    # BPE tokens starting with space (or ▁) indicate new word boundaries
+    words = []
+    current_word_tokens = []
+
+    for sentence in result.sentences:
+        for token in sentence.tokens:
+            token_text = token.text
+            if not token_text:
+                continue
+
+            # Check if this token starts a new word
+            # New word indicators: leading space, leading ▁, or first token
+            is_new_word = (
+                token_text.startswith(" ") or
+                token_text.startswith("▁") or
+                not current_word_tokens
+            )
+
+            if is_new_word and current_word_tokens:
+                # Finish previous word
+                word_text = "".join(t.text for t in current_word_tokens)
+                word_text = word_text.strip().replace("▁", "")
+                if word_text:
+                    words.append(Word(
+                        text=word_text,
+                        start=current_word_tokens[0].start,
+                        end=current_word_tokens[-1].end,
+                    ))
+                current_word_tokens = []
+
+            current_word_tokens.append(token)
+
+    # Don't forget the last word
+    if current_word_tokens:
+        word_text = "".join(t.text for t in current_word_tokens)
+        word_text = word_text.strip().replace("▁", "")
+        if word_text:
+            words.append(Word(
+                text=word_text,
+                start=current_word_tokens[0].start,
+                end=current_word_tokens[-1].end,
+            ))
+
+    return TranscriptResult(
+        text=result.text,
+        words=words,
+    )
 
 
 class ASRModel:
     """
-    Wrapper for parakeet-mlx ASR model.
+    Platform-dispatching ASR model with word-level timestamps.
 
-    Provides transcription with word-level timestamps using MLX acceleration.
+    Selects the darwin (MLX) or linux (NeMo) backend at construction and defers
+    the heavy model load until first transcribe.
     """
 
-    def __init__(self, model_id: str = DEFAULT_MODEL):
+    def __init__(self, model_id: str = DEFAULT_MODEL, device: str = "auto"):
         """
-        Initialize the ASR model.
-
         Args:
-            model_id: HuggingFace model ID for parakeet-mlx model
+            model_id: model id for the active platform's backend.
+            device: 'auto', 'cuda' or 'cpu'. Resolved by the linux backend;
+                ignored on darwin (MLX has no device selection).
         """
+        check_model_id(model_id)
         self.model_id = model_id
+        self.device = device
+        self._backend = _select_backend()
         self._model = None
 
     def _ensure_loaded(self):
@@ -64,14 +199,12 @@ class ASRModel:
         if self._model is not None:
             return
 
+        key = (self.model_id, self.device)
         with _model_cache_lock:
-            cached = _model_cache.get(self.model_id)
+            cached = _model_cache.get(key)
             if cached is None:
-                print(f"Loading ASR model: {self.model_id}")
-                cached = from_pretrained(self.model_id)
-                _model_cache[self.model_id] = cached
-                print("ASR model loaded.")
-
+                cached = self._backend.load(self.model_id, self.device)
+                _model_cache[key] = cached
             self._model = cached
 
     def transcribe(
@@ -82,73 +215,21 @@ class ASRModel:
         overlap_duration: float = 15.0,
     ) -> TranscriptResult:
         """
-        Transcribe audio file with word-level timestamps.
+        Transcribe a 16kHz mono WAV with word-level timestamps.
 
         Args:
             audio_path: Path to 16kHz mono WAV file
             language: Language code (auto-detected if None)
             chunk_duration: Duration of audio chunks for long files
             overlap_duration: Overlap between chunks
-
-        Returns:
-            TranscriptResult with full text and word-level timestamps
         """
         self._ensure_loaded()
-
-        # Transcribe with parakeet-mlx
-        result = self._model.transcribe(
+        return self._backend.transcribe(
+            self._model,
             audio_path,
+            language=language,
             chunk_duration=chunk_duration,
             overlap_duration=overlap_duration,
-        )
-
-        # Extract words by merging BPE subword tokens
-        # BPE tokens starting with space (or ▁) indicate new word boundaries
-        words = []
-        current_word_tokens = []
-
-        for sentence in result.sentences:
-            for token in sentence.tokens:
-                token_text = token.text
-                if not token_text:
-                    continue
-
-                # Check if this token starts a new word
-                # New word indicators: leading space, leading ▁, or first token
-                is_new_word = (
-                    token_text.startswith(" ") or
-                    token_text.startswith("▁") or
-                    not current_word_tokens
-                )
-
-                if is_new_word and current_word_tokens:
-                    # Finish previous word
-                    word_text = "".join(t.text for t in current_word_tokens)
-                    word_text = word_text.strip().replace("▁", "")
-                    if word_text:
-                        words.append(Word(
-                            text=word_text,
-                            start=current_word_tokens[0].start,
-                            end=current_word_tokens[-1].end,
-                        ))
-                    current_word_tokens = []
-
-                current_word_tokens.append(token)
-
-        # Don't forget the last word
-        if current_word_tokens:
-            word_text = "".join(t.text for t in current_word_tokens)
-            word_text = word_text.strip().replace("▁", "")
-            if word_text:
-                words.append(Word(
-                    text=word_text,
-                    start=current_word_tokens[0].start,
-                    end=current_word_tokens[-1].end,
-                ))
-
-        return TranscriptResult(
-            text=result.text,
-            words=words,
         )
 
 
@@ -156,17 +237,16 @@ def transcribe_audio(
     audio_path: str,
     model_id: str = DEFAULT_MODEL,
     language: Optional[str] = None,
+    device: str = "auto",
 ) -> TranscriptResult:
     """
     Convenience function to transcribe audio.
 
     Args:
         audio_path: Path to 16kHz mono WAV file
-        model_id: HuggingFace model ID
+        model_id: model id for the active platform's backend
         language: Language code (auto-detected if None)
-
-    Returns:
-        TranscriptResult with words and timestamps
+        device: 'auto', 'cuda' or 'cpu' (see ASRModel)
     """
-    model = ASRModel(model_id)
+    model = ASRModel(model_id, device=device)
     return model.transcribe(audio_path, language=language)
