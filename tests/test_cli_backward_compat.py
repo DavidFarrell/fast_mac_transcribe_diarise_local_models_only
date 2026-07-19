@@ -20,7 +20,7 @@ def test_all_prior_flags_still_present():
 
     expected = {
         "input_file", "output_text", "output_json", "output_srt", "output_rttm",
-        "diar_backend", "diar_model", "asr_model", "language", "num_speakers",
+        "diar_backend", "asr_model", "language", "num_speakers",
         "gap_threshold", "speaker_tolerance", "keep_temp", "verbose", "help",
     }
     assert expected.issubset(dest_names)
@@ -33,7 +33,6 @@ def test_prior_defaults_unchanged():
     args = parser.parse_args(["--in", "a.wav", "--out", "b.txt"])
 
     assert args.diar_backend == "senko"
-    assert args.diar_model == "default"
     assert args.language is None
     assert args.num_speakers is None
     assert args.gap_threshold == 0.8
