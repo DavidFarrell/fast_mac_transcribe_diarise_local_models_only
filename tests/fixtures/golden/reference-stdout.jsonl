@@ -1,0 +1,41 @@
+{"type": "status", "stage": "preparing"}
+{"type": "status", "stage": "transcribing", "stream": "system"}
+Loading ASR model: mlx-community/parakeet-tdt-0.6b-v3
+ASR model loaded.
+{"type": "status", "stage": "diarizing", "stream": "system"}
+Initializing Senko diarizer...
+Using device: coreml
+Using pyannote VAD (CoreML)
+Loading embedding model ........ done [3.3s]
+Using CPU clustering
+Senko diarizer ready.
+Running Senko diarisation on: /private/var/folders/st/0q26rty96h55c13fvtfndgfh0000gn/T/normalised__5i50s_m.wav
+
+    [38;2;120;167;214mnormalised__5i50s_m.wav[0m
+      ├── Voice activity detection ..... done [0.02s]
+      ├── Fbank feature extraction ..... done [0.01s]
+      ├── Embeddings generation ........ done [0.04s]
+      └── Clustering ................... done [0.06s]
+
+    Total diarization time: 0.13s
+
+  Detected 3 speakers, 8 segments
+{"type": "status", "stage": "merging", "stream": "system"}
+{"type": "status", "stage": "recovering", "stream": "system", "windows": 0}
+{"type": "status", "stage": "transcribing", "stream": "mic"}
+{"type": "status", "stage": "diarizing", "stream": "mic"}
+Running Senko diarisation on: /private/var/folders/st/0q26rty96h55c13fvtfndgfh0000gn/T/normalised_5riowr5o.wav
+
+    [38;2;120;167;214mnormalised_5riowr5o.wav[0m
+      ├── Voice activity detection ..... done [0.02s]
+      ├── Fbank feature extraction ..... done [0.01s]
+      ├── Embeddings generation ........ done [0.01s]
+      └── Clustering ................... done [0.00s]
+
+    Total diarization time: 0.04s
+
+  Detected 4 speakers, 5 segments
+{"type": "status", "stage": "merging", "stream": "mic"}
+{"type": "status", "stage": "recovering", "stream": "mic", "windows": 0}
+{"type": "status", "stage": "complete"}
+{"type": "result", "turns": [{"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 0.24, "t1": 2.8000000000000003, "text": "Right, shall we make a start? This is"}, {"speaker_id": "system:SPEAKER_03", "stream": "system", "t0": 2.8000000000000003, "t1": 4.88, "text": "the weekly pipeline check-in."}, {"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 4.88, "t1": 5.84, "text": "First item is"}, {"speaker_id": "system:SPEAKER_03", "stream": "system", "t0": 5.84, "t1": 7.760000000000001, "text": "the transcription backend. How"}, {"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 7.76, "t1": 25.52, "text": "did the migration go? That's encouraging. Did the speaker separation hold up when two people talked over each"}, {"speaker_id": "mic:SPEAKER_03", "stream": "mic", "t0": 9.92, "t1": 19.36, "text": "It went better than expected, actually. The batch jobs finished overnight, and the word error rate came down by about 2% on the evaluation set."}, {"speaker_id": "system:SPEAKER_02", "stream": "system", "t0": 25.52, "t1": 26.080000000000002, "text": "other?"}, {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 26.8, "t1": 27.6, "text": "Mostly,"}, {"speaker_id": "mic:SPEAKER_04", "stream": "mic", "t0": 27.6, "t1": 34.64, "text": "yes. There were a couple of rough patches near the end of long meetings, but nothing that broke the downstream summaries."}, {"speaker_id": "system:SPEAKER_02", "stream": "system", "t0": 35.12, "t1": 44.800000000000004, "text": "Can I jump in here? I looked at the logs this morning, and the embedding cache was cold for the first three runs. That alone explains most of the slowdown."}, {"speaker_id": "mic:SPEAKER_02", "stream": "mic", "t0": 46.480000000000004, "t1": 53.6, "text": "Let's warm the cache before the next benchmark then, and compare like for like. I'll write that up as an action for Thursday."}, {"speaker_id": "system:SPEAKER_01", "stream": "system", "t0": 54.24, "t1": 64.96, "text": "Perfect. Last thing, the golden fixture. Once this recording exists, every platform should produce the same turns from the same audio. Agreed?"}, {"speaker_id": "mic:SPEAKER_01", "stream": "mic", "t0": 66.48, "t1": 72.24, "text": "Same audio in, same turns out on any machine. That's the whole point."}], "speakers": ["mic:SPEAKER_01", "mic:SPEAKER_02", "mic:SPEAKER_03", "mic:SPEAKER_04", "system:SPEAKER_01", "system:SPEAKER_02", "system:SPEAKER_03"], "duration": 72.24}
