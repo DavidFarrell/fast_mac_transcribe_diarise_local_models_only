@@ -16,9 +16,12 @@ AMENDMENTS from execution (recorded here so later slices read one truth):
   contract is the event/turn SCHEMA, not stdout purity. Pure-JSONL stdout on
   Linux is an improvement we add; Slice 4's reference comparison must
   tolerate the Mac's non-JSON lines (filter to JSON-parseable lines first).
-- Senko's CPU path uses silero VAD (no HF gate); the pyannote/segmentation-3.0
-  gate applies only to its CUDA path - folded into the GPU-gate pending job
-  (token step for David at reboot time).
+- NO HF gate on either senko path (corrected during execution): senko bundles
+  all model weights in its pinned git package (senko/models/) and loads
+  pyannote segmentation from a LOCAL file - the gated HF repo is never
+  accessed, HF cache stays empty. No token step at the GPU gate. Residual
+  GPU-gate checks: kaldifeat build-installability, and that pyannote-audio's
+  from_pretrained on the local path stays offline.
 
 The only repo change this slice makes is committing its ground-truth note to
 `design/slice0-ground-truth.md`. Contents required:
